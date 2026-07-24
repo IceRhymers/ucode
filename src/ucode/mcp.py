@@ -1190,7 +1190,7 @@ def _resolve_location_mcp_servers(
     return [*working_servers, *_skills_entries(original_servers)]
 
 
-def _setup_mcp_clients(state: dict, section: str) -> tuple[str, str | None, list[str]]:
+def setup_mcp_clients(state: dict, section: str) -> tuple[str, str | None, list[str]]:
     """Validate the workspace, resolve configured MCP clients, and prepare auth.
 
     Returns ``(workspace, profile, clients)`` and prints the section header, the
@@ -1253,7 +1253,7 @@ def configure_mcp_command(location: str | None = None, services: set[str] | None
             )
         location = next(iter(schemas))
     state = load_state()
-    workspace, profile, clients = _setup_mcp_clients(state, "MCP Servers")
+    workspace, profile, clients = setup_mcp_clients(state, "MCP Servers")
 
     original_mcp_servers_for_location: list[dict] = list(state.get("mcp_servers") or [])
     if location is not None:
@@ -1424,6 +1424,21 @@ def configure_skills_mcp_command(locations: list[str]) -> int:
     """Set the skills MCP connection's ``skill_locations`` to exactly ``locations``,
     replacing any previous set."""
     state = load_state()
-    workspace, _profile, clients = _setup_mcp_clients(state, "Skills MCP")
+    workspace, _profile, clients = setup_mcp_clients(state, "Skills MCP")
     _update_skills_mcp(state, workspace, clients, locations)
     return 0
+
+
+def _skill_mcp_locations(state: dict) -> list[str]:
+    """The skills MCP connection's ``skill_locations``, or ``[]`` if none exists."""
+    entry = next(iter(_skills_entries(list(state.get("mcp_servers") or []))), None)
+    return list((entry or {}).get("skill_locations") or [])
+
+
+def register_schemaless_skills_connection(state: dict, workspace: str, clients: list[str]) -> None:
+    """Register/keep the skills MCP connection without changing its schema set.
+
+    Download mode calls this after writing files: it preserves any prior
+    ``--mcp`` ``skill_locations`` and otherwise registers the bare schema-less
+    route (utility tools only)."""
+    _update_skills_mcp(state, workspace, clients, _skill_mcp_locations(state))

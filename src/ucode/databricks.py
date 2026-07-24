@@ -290,6 +290,35 @@ def _http_post_json(
         return None, f"network error: {exc.reason}"
 
 
+def _http_get_bytes(url: str, token: str, *, timeout: int = 10) -> tuple[bytes | None, str | None]:
+    """GET raw bytes. Returns (body, None) on success, (None, reason) on failure.
+
+    Like `_http_get_json` but leaves the body undecoded, since skill bundles can
+    contain binary files.
+    """
+    request = urllib_request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib_request.urlopen(request, timeout=timeout) as response:
+            body = response.read()
+        _debug(f"GET {url}", f"HTTP 200, {len(body)} bytes")
+        return body, None
+    except urllib_error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+        except Exception:
+            detail = ""
+        _debug(f"GET {url}", f"HTTP {exc.code} {exc.reason}")
+        reason = f"HTTP {exc.code} {exc.reason}"
+        excerpt = detail.strip()[:200]
+        if excerpt:
+            reason = f"{reason}: {excerpt}"
+        return None, reason
+    except urllib_error.URLError as exc:
+        _debug(f"GET {url}", f"URLError: {exc.reason}")
+        return None, f"network error: {exc.reason}"
+
+
 def get_current_user_name(workspace: str, token: str) -> str | None:
     """Return the current user's login (email) via SCIM `Me`, or None on failure.
 

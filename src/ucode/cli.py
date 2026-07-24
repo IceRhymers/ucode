@@ -59,6 +59,7 @@ from ucode.mcp import (
     purge_cross_workspace_mcp_residue,
     revert_mcp_configs,
 )
+from ucode.skills_download import configure_skills_download_command
 from ucode.state import (
     STATE_PATH,
     clear_state,
@@ -1403,21 +1404,31 @@ def configure_skills(
     ],
     mcp: Annotated[
         bool,
-        typer.Option(
-            "--mcp", help="Manage the skills MCP connection (required until download mode lands)."
-        ),
+        typer.Option("--mcp", help="Mutate the skills MCP connection instead of downloading."),
     ] = False,
+    path: Annotated[
+        str | None,
+        typer.Option(
+            "--path",
+            help="(download) Existing absolute dir to download into; defaults to your home dir.",
+        ),
+    ] = None,
 ) -> None:
     """Configure Databricks Skills for your coding tools.
 
-    ``--location`` sets the skills MCP connection's scope to exactly the listed
-    schemas, replacing any previous set.
+    By default, downloads every skill in each ``--location`` schema to disk
+    (under ``--path``, or your home dir when omitted) and registers a schema-less
+    MCP connection. With ``--mcp``, instead sets the skills MCP connection's scope
+    to exactly the listed schemas.
     """
     try:
-        if not mcp:
-            raise RuntimeError("Download mode is not available yet; pass --mcp for now.")
-        configure_skills_mcp_command(_parse_skill_locations(location))
-    except RuntimeError as exc:
+        if mcp:
+            if path is not None:
+                raise RuntimeError("--path is not valid with --mcp.")
+            configure_skills_mcp_command(_parse_skill_locations(location))
+        else:
+            configure_skills_download_command(_parse_skill_locations(location), path=path)
+    except (RuntimeError, ValueError) as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None
     except KeyboardInterrupt:
