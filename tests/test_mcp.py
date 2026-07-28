@@ -19,6 +19,11 @@ GH_URL = f"{WS}/api/2.0/mcp/external/github"
 PROXY_TAIL = ["mcp-proxy", "--url", GH_URL, "--host", WS, "--profile", "p"]
 
 
+def _unwrap(text: str) -> str:
+    """Collapse rich's line-wrapping so assertions match regardless of terminal width."""
+    return " ".join(text.split())
+
+
 def _proxy_argv() -> list[str]:
     from ucode.databricks import build_mcp_proxy_argv
 
@@ -1948,6 +1953,50 @@ class TestRegisterSchemalessSkillsConnection:
         mcp.register_schemaless_skills_connection(state, WS, None, ["claude"])
 
         assert _find_skills(state["mcp_servers"])[0]["skill_locations"] == ["X.x", "Y.y"]
+
+
+class TestSkillsToolsDescription:
+    def test_bare_route_names_utility_tools_only(self):
+        assert mcp._skills_tools_description([]) == "UC skill utility tools"
+
+    def test_scoped_names_utility_plus_skills_tools(self):
+        assert mcp._skills_tools_description(["main.default"]) == (
+            "UC skill utility tools + skills tools in schema main.default"
+        )
+
+    def test_multiple_schemas_joined_with_and(self):
+        assert mcp._skills_tools_description(["a.b", "c.d", "e.f"]) == (
+            "UC skill utility tools + skills tools in schema a.b, c.d and e.f"
+        )
+
+
+class TestPrintSkillsSummary:
+    def _entry(self, locations):
+        return mcp._resolve_skills_mcp_servers(WS, ["claude", "codex"], locations, [])[0]
+
+    def test_reports_scoped_connection(self, capsys):
+        mcp._print_skills_summary(self._entry(["main.default"]))
+        assert _unwrap(capsys.readouterr().out) == (
+            "✔ Skills MCP registered "
+            "Server: databricks-skill-registry "
+            f"URL: {WS}/ai-gateway/skills/?schema=main.default "
+            "Configured: Claude Code, Codex "
+            "Tools: UC skill utility tools + skills tools in schema main.default "
+            "• Run `ucode <agent>` to use the skills MCP. For existing sessions, "
+            "restart the agent for the skills to take effect."
+        )
+
+    def test_reports_schemaless_connection(self, capsys):
+        mcp._print_skills_summary(self._entry([]))
+        assert _unwrap(capsys.readouterr().out) == (
+            "✔ Skills MCP registered "
+            "Server: databricks-skill-registry "
+            f"URL: {WS}/ai-gateway/skills/ "
+            "Configured: Claude Code, Codex "
+            "Tools: UC skill utility tools "
+            "• Run `ucode <agent>` to use the skills MCP. For existing sessions, "
+            "restart the agent for the skills to take effect."
+        )
 
 
 class TestRevertMcpConfigs:

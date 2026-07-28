@@ -43,6 +43,8 @@ from ucode.databricks import (
 )
 from ucode.state import load_full_state, load_state, save_state
 from ucode.ui import (
+    console,
+    print_kv,
     print_note,
     print_section,
     print_success,
@@ -1460,6 +1462,37 @@ def _resolve_skills_mcp_servers(
     return [*kept, _build_skills_entry(workspace, locations, merged)]
 
 
+def _join_with_and(items: list[str]) -> str:
+    if len(items) <= 1:
+        return items[0] if items else ""
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def _skills_tools_description(locations: list[str]) -> str:
+    if not locations:
+        return "UC skill utility tools"
+    return f"UC skill utility tools + skills tools in schema {_join_with_and(locations)}"
+
+
+def _print_skills_summary(entry: dict) -> None:
+    """Report the registered skills connection and how to start using it."""
+    clients = [
+        str(MCP_CLIENTS[client]["display"])
+        for client in (entry.get("clients") or [])
+        if client in MCP_CLIENTS
+    ]
+    console.print()
+    print_success("Skills MCP registered")
+    print_kv("Server", str(entry.get("name") or SKILLS_MCP_SERVER_NAME))
+    print_kv("URL", str(entry.get("url") or ""))
+    print_kv("Configured", ", ".join(clients) if clients else "none")
+    print_kv("Tools", _skills_tools_description(entry.get("skill_locations") or []))
+    print_note(
+        "Run `ucode <agent>` to use the skills MCP. For existing sessions, "
+        "restart the agent for the skills to take effect."
+    )
+
+
 def _update_skills_mcp(
     state: dict, workspace: str, profile: str | None, clients: list[str], locations: list[str]
 ) -> None:
@@ -1470,7 +1503,8 @@ def _update_skills_mcp(
     if changed or original != working:
         state["mcp_servers"] = working
         save_state(state)
-        print_success("Saved")
+    entry = next(s for s in working if s.get("kind") == SKILLS_MCP_KIND)
+    _print_skills_summary(entry)
 
 
 def configure_skills_mcp_command(locations: list[str]) -> int:
