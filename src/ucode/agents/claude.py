@@ -129,17 +129,46 @@ def _managed_settings_path() -> Path | None:
     return None
 
 
-def _managed_api_key_helper_path() -> Path | None:
-    """Path to the enterprise managed-settings.json when it sets an apiKeyHelper,
-    else None. The managed scope always wins over --settings and subscription
-    OAuth, so a managed apiKeyHelper silently shadows relayed auth."""
+def _managed_relayed_conflicts() -> tuple[Path, list[str]] | None:
+    """Enterprise managed-settings keys that would break relayed auth, if any.
+    The managed scope always wins (per key) over the --settings file and
+    subscription OAuth, so a managed value here overrides what ucode writes:
+    'apiKeyHelper' shadows the subscription login, 'env.ANTHROPIC_BASE_URL'
+    clobbers our loopback proxy URL, and 'env.ANTHROPIC_CUSTOM_HEADERS' drops
+    the Databricks-Model-Provider-Service routing headers — each sends traffic
+    somewhere the relayed token swap can't reach or route correctly.
+    Returns (path, conflicting-key-labels) or None when there's no conflict."""
     path = _managed_settings_path()
     if path is None or not path.is_file():
         return None
     settings = read_json_safe(path)
-    if isinstance(settings, dict) and settings.get("apiKeyHelper"):
-        return path
-    return None
+    conflicts: list[str] = []
+    if settings.get("apiKeyHelper"):
+        conflicts.append("apiKeyHelper")
+    env = settings.get("env")
+    if isinstance(env, dict):
+        if env.get("ANTHROPIC_BASE_URL"):
+            conflicts.append("env.ANTHROPIC_BASE_URL")
+        if env.get("ANTHROPIC_CUSTOM_HEADERS"):
+            conflicts.append("env.ANTHROPIC_CUSTOM_HEADERS")
+    return (path, conflicts) if conflicts else None
+
+
+def _managed_pinned_model() -> tuple[Path, str] | None:
+    """Model that enterprise managed settings force Claude Code to launch with,
+    if any. Only `ANTHROPIC_MODEL` sets the launch model — the
+    `ANTHROPIC_DEFAULT_*` family aliases just remap what each tier resolves to
+    when selected, so they don't change the default. Doesn't break relayed auth,
+    but silently overrides Claude Code's model, so we surface it. Returns
+    (path, model_id) or None when the file is absent or `ANTHROPIC_MODEL` is unset."""
+    path = _managed_settings_path()
+    if path is None or not path.is_file():
+        return None
+    settings = read_json_safe(path)
+    env = settings.get("env")
+    if not isinstance(env, dict) or not env.get("ANTHROPIC_MODEL"):
+        return None
+    return (path, str(env["ANTHROPIC_MODEL"]))
 
 
 def relayed_proxy_base_url(state: dict) -> str:
@@ -800,16 +829,24 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     exec, so we spawn-and-wait rather than replacing the process)."""
     from ucode.gateway_proxy import start_proxy
 
-    managed_path = _managed_api_key_helper_path()
-    if managed_path is not None:
+    conflict = _managed_relayed_conflicts()
+    if conflict is not None:
+        managed_path, keys = conflict
         print_err(
-            f"Enterprise managed settings ({managed_path}) set an 'apiKeyHelper', "
-            "which Claude Code always applies over relayed (Claude Max/Enterprise) "
-            "auth — you'd be billed for API usage instead of using your subscription. "
-            "Remove the 'apiKeyHelper' from that file (or ask your admin to) before "
-            "running relayed auth. Not starting Claude Code."
+            "Enterprise managed settings are present, which Claude Code always "
+            "applies over relayed (Claude Max/Enterprise) auth. Remove "
+            f"{', '.join(keys)} from {managed_path} file before running relayed auth."
         )
         raise SystemExit(1)
+
+    pinned_model = _managed_pinned_model()
+    if pinned_model is not None:
+        managed_path, model_id = pinned_model
+        print_warning(
+            f"Default model ANTHROPIC_MODEL: {model_id} is set in your "
+            f"enterprise-managed settings ({managed_path}) and may override ucode "
+            "settings. Remove this entry if you encounter issues."
+        )
 
     _ensure_subscription_login()
     workspace = state["workspace"]
