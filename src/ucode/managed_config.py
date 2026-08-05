@@ -4,11 +4,13 @@ An org admin authors a ``CodingAgentConfig`` through the Databricks AI Gateway; 
 (non-admin) and ``ucode`` applies it locally. This module owns the developer-read half:
 
 - fetching the raw manifest (via :func:`ucode.databricks.fetch_managed_coding_agent_configs`),
-- normalizing the proto-JSON into a stable internal dict keyed by ucode's own tool names, and
-- persisting it to ``~/.ucode/managed-state.json`` (0600) so launches can reconcile against it.
+- normalizing the proto-JSON into a stable internal dict keyed by ucode's own tool names,
+- persisting it to ``~/.ucode/managed-state.json`` (0600), and
+- re-reading it on each launch, falling back to the persisted copy when the read fails.
 
-Reconciliation against the local ``state.json`` and applying the manifest to agents live in later
-changes; this module deliberately stops at "read + normalize + persist".
+:func:`managed_launch_state` is the launch path's entry point: it refreshes the manifest and hands
+back the state to configure the agent with. Deciding *which* value wins for a given key is
+:mod:`ucode.managed_resolve`'s job, kept separate so that logic stays pure and I/O-free.
 """
 
 from __future__ import annotations
@@ -19,9 +21,15 @@ from pathlib import Path
 from typing import cast
 
 import ucode.config_io as config_io
-from ucode.databricks import fetch_managed_coding_agent_configs
+from ucode.databricks import fetch_managed_coding_agent_configs, get_databricks_token
+from ucode.managed_resolve import resolve_state
+from ucode.ui import print_warning
 
 MANAGED_STATE_PATH = config_io.APP_DIR / "managed-state.json"
+
+# Opt-in switch while the feature is in bug bash: unset means launches ignore managed configs
+# entirely and behave exactly as they did before.
+MANAGED_CONFIG_ENV_VAR = "ENABLE_MANAGED_AGENT_CONFIG"
 
 # Shown to a developer when their workspace has no admin-defined managed config yet — the normal
 # case, not an error. Kept here so the CLI (which surfaces it) uses one consistent message.
@@ -237,12 +245,15 @@ def get_managed_config(workspace: str, token: str) -> tuple[dict | None, str | N
 
     Returns ``(config, reason)``:
     - ``(config, None)`` — the normalized manifest for the workspace's single config;
-    - ``(None, None)`` — no managed config is defined for the workspace (not an error);
-    - ``(None, reason)`` — the read failed; ``reason`` says why.
+    - ``(None, None)`` — the workspace definitively has no managed config (not an error);
+    - ``(None, reason)`` — the read didn't settle the question; ``reason`` says why.
 
-    "No config defined" arrives two ways depending on the backend: an empty listing (HTTP 200
-    with no configs) or a NOT_FOUND (HTTP 404). Both are the normal, non-error case for a workspace
-    whose admin hasn't set one up, so both collapse to ``(None, None)``.
+    The distinction matters to callers that cache: only ``(None, None)`` is authoritative enough to
+    clear a previously stored config. "No config defined" arrives two ways depending on the backend
+    — an empty listing (HTTP 200 with no configs) or a NOT_FOUND — and both collapse to
+    ``(None, None)``. Anything else, including a PERMISSION_DENIED, leaves the question unanswered
+    and is surfaced as a failure: an admin may have published a config the developer can't read,
+    which they need to know about rather than silently launch without.
 
     v0 stores at most one config per workspace, so the first entry is the workspace's config.
     """
@@ -258,7 +269,7 @@ def get_managed_config(workspace: str, token: str) -> tuple[dict | None, str | N
 
 
 def _is_not_found(reason: str) -> bool:
-    """True when a read failure reason indicates the config simply doesn't exist yet.
+    """True when a read failure reason means the workspace definitively has no managed config.
 
     ``_http_get_json`` formats failures as ``HTTP <code> <text>[: <body>]``; a NOT_FOUND surfaces
     as an ``HTTP 404`` there (and the API's error body carries ``NOT_FOUND``)."""
@@ -266,11 +277,26 @@ def _is_not_found(reason: str) -> bool:
     return "http 404" in lowered or "not_found" in lowered
 
 
+def _is_permission_denied(reason: str) -> bool:
+    """True when the read was refused rather than answering whether a config exists.
+
+    The read is meant to be available to any workspace user, so a refusal means the workspace's
+    managed config isn't readable by this developer — worth telling them about, since an admin may
+    have published a config that silently isn't reaching them. It settles nothing about whether one
+    exists, so a cached config is left in place rather than cleared."""
+    lowered = reason.lower()
+    return "http 403" in lowered or "permission_denied" in lowered
+
+
 def save_managed_state(workspace: str, config: dict) -> None:
     """Persist the normalized managed config to ``~/.ucode/managed-state.json`` at mode 0600.
 
     The file is org-authored, not developer-editable — 0600 keeps it readable/writable only by the
     user (a light guard; hard enforcement / sudo ownership is a separate concern). No-op in dry-run.
+
+    An empty ``config`` records "this workspace has no managed config", which matters because the
+    file doubles as the fallback when a later read fails: without it, removing a config server-side
+    would leave the old one on disk to be reapplied after a transient outage.
     """
     if config_io.is_dry_run():
         return
@@ -307,11 +333,118 @@ def load_managed_state(workspace: str | None) -> dict | None:
     return config if isinstance(config, dict) else None
 
 
-def delete_managed_state() -> None:
-    """Remove the managed-state file, if any. No-op in dry-run."""
-    if config_io.is_dry_run():
-        return
+def refresh_managed_config(state: dict) -> dict | None:
+    """Fetch the workspace's managed config and persist it, returning the normalized manifest.
+
+    Runs on every launch so a developer picks up an admin's edits without re-running
+    ``ucode configure``. Returns None when the workspace has no managed config — the normal case for
+    a workspace whose admin hasn't published one.
+
+    A failed fetch never blocks the launch: an unreachable control plane shouldn't stop someone from
+    coding. Instead it falls back to the last config persisted for this workspace, so the admin's
+    most recent known policy still applies; only when there is no persisted config either does the
+    launch fall through to the developer's own settings.
+    """
+    workspace = state.get("workspace")
+    if not workspace:
+        return None
     try:
-        MANAGED_STATE_PATH.unlink(missing_ok=True)
-    except OSError as exc:
-        raise RuntimeError(f"Failed to remove managed state file: {MANAGED_STATE_PATH}") from exc
+        token = get_databricks_token(workspace, state.get("profile"))
+    except RuntimeError as exc:
+        return _persisted_fallback(workspace, str(exc))
+    managed, reason = get_managed_config(workspace, token)
+    if reason is not None:
+        # A refused read leaves the cached config alone: it says nothing about whether the admin's
+        # config still exists, unlike a successful "no config" answer below.
+        return _persisted_fallback(workspace, reason, refused=_is_permission_denied(reason))
+    if managed is None:
+        # Record that this workspace has no config, rather than leaving an earlier one on disk:
+        # the file doubles as the fallback above, so a removed policy would otherwise come back
+        # into force after the next transient outage.
+        save_managed_state(workspace, {})
+        return None
+    save_managed_state(workspace, managed)
+    return managed
+
+
+def _persisted_fallback(workspace: str, reason: str, *, refused: bool = False) -> dict | None:
+    """Return the last persisted config for ``workspace`` after a failed fetch.
+
+    Warns only when there is a config to fall back on, because then the launch proceeds on an admin
+    policy that may be out of date. With nothing persisted there is no managed config in play at
+    all, so staying quiet keeps someone with (say) an expired session from being told about a
+    feature they don't use — including when the read was ``refused``, since a refusal is no evidence
+    that a config exists.
+    """
+    # An empty persisted config means the last successful read found none, so there is no admin
+    # policy to fall back to — treat it the same as having no file at all.
+    persisted = load_managed_state(workspace)
+    if not persisted:
+        return None
+    summary = _summarize_read_failure(reason)
+    if refused:
+        print_warning(
+            f"Your workspace's managed config is not readable by you ({summary}); using the last "
+            "one saved for this workspace. Ask an admin to grant access."
+        )
+    else:
+        print_warning(
+            f"Could not read your workspace's managed config ({summary}); "
+            "using the last one saved for this workspace."
+        )
+    return persisted
+
+
+def _summarize_read_failure(reason: str) -> str:
+    """Condense a read failure into one short line fit for a terminal warning.
+
+    ``_http_get_json`` appends the raw response body, which for a gateway error is a multi-line JSON
+    blob (error_code, message, request_id, trace ids). Surface just the status and the API's own
+    message; the full text is still available under ``UCODE_DEBUG=1``.
+    """
+    status, _, body = reason.partition(": ")
+    body = body.strip()
+    if body.startswith("{"):
+        try:
+            parsed = json.loads(body)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            message = _str(parsed.get("message")) or _str(parsed.get("error_code"))
+            if message:
+                return f"{status.strip()}: {message}"
+        return status.strip()
+    condensed = " ".join(reason.split())
+    return condensed if len(condensed) <= 160 else condensed[:157] + "..."
+
+
+def managed_agent_config_enabled() -> bool:
+    """True when managed coding-agent configs are switched on for this run.
+
+    Opt-in while the feature is being bug-bashed: without the env var set, launches behave exactly
+    as they did before and never read the workspace's config."""
+    return os.environ.get(MANAGED_CONFIG_ENV_VAR, "").strip().lower() in ("1", "true", "yes")
+
+
+def managed_launch_state(
+    state: dict, tool: str, *, skip_preflight: bool = False
+) -> tuple[dict, dict | None]:
+    """Return ``(state, managed)`` for launching ``tool`` under any managed config.
+
+    The returned state has the manifest's models and provider layered over the developer's own —
+    managed wins per key — so the settings file written from it reflects the admin's choices. When
+    the workspace has no managed config the state is handed back untouched.
+
+    ``skip_preflight`` mirrors the launch flag: managed/headless launchers pass it to avoid
+    per-launch network calls, so the config is read from the last persisted copy instead of being
+    re-fetched (which means it can be arbitrarily stale until a normal launch refreshes it).
+    """
+    if not managed_agent_config_enabled():
+        return state, None
+    if skip_preflight:
+        managed = load_managed_state(state.get("workspace")) or None
+    else:
+        managed = refresh_managed_config(state)
+    if managed is None:
+        return state, None
+    return resolve_state(managed, state, tool), managed
