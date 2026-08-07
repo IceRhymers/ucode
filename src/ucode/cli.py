@@ -33,7 +33,7 @@ from ucode.agents import (
 )
 from ucode.agents.codex import revert_legacy_shared_config
 from ucode.agents.pi import PI_SETTINGS_BACKUP_PATH, PI_SETTINGS_PATH
-from ucode.config_io import restore_file, set_dry_run
+from ucode.config_io import is_dry_run, restore_file, set_dry_run
 from ucode.databricks import (
     apply_pat_environment,
     build_shared_base_urls,
@@ -56,7 +56,13 @@ from ucode.databricks import (
     resolve_pat_token,
     run_databricks_login,
 )
+from ucode.managed_budget import (
+    budget_usage_percent,
+    recommendation_line,
+    render_budget_panel,
+)
 from ucode.managed_config import (
+    get_model_recommendation,
     load_managed_state,
     managed_agent_config_enabled,
     refresh_managed_config,
@@ -64,9 +70,11 @@ from ucode.managed_config import (
 from ucode.managed_resolve import (
     managed_default_model,
     managed_enabled_tools,
+    managed_launch_model,
     managed_provider_service,
     managed_supplies_models,
     managed_unservable_models,
+    recommended_agent,
     resolve_state,
 )
 from ucode.managed_wizard import setup_command, show_command
@@ -1281,6 +1289,76 @@ def _fetch_managed_config(state: dict, *, skip_preflight: bool) -> dict | None:
         return refresh_managed_config(state)
 
 
+def _note_recommended_agent(recommendation: dict | None, tool: str) -> None:
+    """Say when the budget tier points at a different agent than the one being launched.
+
+    Launching any enabled agent is allowed, so this informs rather than blocks — and explains why
+    the session is not on the tier's model.
+    """
+    # The tier's own agent, not `recommended_agent`'s default_agent fallback: there is nothing to
+    # say when the config's baseline simply differs from what the developer asked for.
+    agent = (recommendation or {}).get("agent")
+    if agent == tool or agent not in TOOL_SPECS:
+        return
+    model = (recommendation or {}).get("model")
+    suffix = f" with {model}" if isinstance(model, str) and model else ""
+    print_note(
+        f"Your budget tier recommends {TOOL_SPECS[agent]['display']}{suffix}; "
+        f"launching {TOOL_SPECS[tool]['display']} as requested."
+    )
+
+
+def _fetch_budget_recommendation(
+    state: dict, managed: dict | None, *, skip_preflight: bool
+) -> dict | None:
+    """The agent and model the caller's budget tier allows, or None when there is no budget to read.
+
+    Enforcement is server-side, so a failed read only costs the recommendation: the config's own
+    ``default_model`` still applies and the launch proceeds.
+    """
+    # --dry-run resolves the agent from the last saved config alone, so it must not reach the
+    # control plane — mirroring the managed-config read, which is likewise skipped under --dry-run.
+    if managed is None or skip_preflight or is_dry_run():
+        return None
+    reason: str | None = None
+    recommendation = None
+    with spinner("Checking your budget..."):
+        try:
+            recommendation, reason = get_model_recommendation(
+                state["workspace"],
+                get_databricks_token(state["workspace"], state.get("profile")),
+            )
+        except (RuntimeError, OSError) as exc:
+            # A token that lapsed since the config refresh — or a Databricks CLI that isn't
+            # installed or reachable — must not block the launch; the config's default_model stands.
+            reason = str(exc)
+    if reason is not None:
+        print_warning(
+            f"Could not check your budget ({reason}); "
+            "using the default model from your workspace's config."
+        )
+    return recommendation
+
+
+def _print_budget_panel(recommendation: dict, tool: str, managed: dict | None = None) -> None:
+    """Show the workspace budget this launch spends against, when one is configured."""
+    agent = recommendation.get("agent")
+    display_agent = TOOL_SPECS[agent]["display"] if agent in TOOL_SPECS else None
+    percent = budget_usage_percent(
+        float(recommendation.get("current_spend") or 0.0),
+        float(recommendation.get("effective_threshold") or 0.0),
+    )
+    line = recommendation_line(display_agent, recommendation.get("model"), percent)
+    panel = render_budget_panel(
+        recommendation,
+        title=f"ucode with {TOOL_SPECS[tool]['display']}",
+        extra_lines=[line] if line else None,
+        managed=managed,
+    )
+    if panel is not None:
+        console.print(panel)
+
+
 def _launch_tool(
     tool_name: str,
     ctx: typer.Context,
@@ -1289,6 +1367,7 @@ def _launch_tool(
     workspace: str | None = None,
     enable_smart_routing_flag: bool = False,
     managed: dict | None = None,
+    recommendation: dict | None = None,
 ) -> None:
     try:
         tool = normalize_tool(tool_name)
@@ -1341,6 +1420,12 @@ def _launch_tool(
         # An admin-published managed config wins over the developer's own settings. Layered on after
         # `configure_shared_state`, whose returned state it overrides, and before the provider and
         # model are settled below — the two state files are never merged on disk.
+        # Bare `ucode` already read one to choose the agent; refetching would double the round trip.
+        if recommendation is None:
+            recommendation = _fetch_budget_recommendation(
+                state, managed, skip_preflight=skip_preflight
+            )
+        _note_recommended_agent(recommendation, tool)
         if managed is not None:
             state = resolve_state(managed, state, tool)
             print_success("Applied your workspace's managed coding agent config")
@@ -1413,7 +1498,9 @@ def _launch_tool(
             # in as the explicit model rather than being applied afterwards: for codex the proto has
             # no model list at all, so passing it here is the only way a launch succeeds when the
             # workspace's own discovery turned up nothing.
-            managed_model = managed_default_model(managed, tool) if managed is not None else None
+            managed_model = (
+                managed_launch_model(managed, recommendation, tool) if managed is not None else None
+            )
             state, resolved_model = resolve_launch_model(tool, state, managed_model)
             if routing_agent is not None and routing_agent.smart_routing_enabled(state):
                 display = TOOL_SPECS[tool]["display"]
@@ -1473,6 +1560,8 @@ def _launch_tool(
                 f"{TOOL_SPECS[tool]['display']} token refresh is managed automatically "
                 f"every 30 minutes while the session is running."
             )
+        if recommendation is not None:
+            _print_budget_panel(recommendation, tool, managed)
         print_success(f"Starting {TOOL_SPECS[tool]['display']}")
         launch_agent(tool, state, ctx.args)
     except RuntimeError as exc:
@@ -1597,7 +1686,12 @@ def _launch_managed_default(
             return
         _print_no_managed_config_guidance(current, state.get("profile"))
         return
-    tool = managed.get("default_agent") or next(iter(managed.get("enabled_agents") or {}), None)
+    # The budget tier can move the org to a cheaper agent, so it outranks the config's
+    # default_agent. Fetched here and handed to _launch_tool so it is read once per launch.
+    recommendation = _fetch_budget_recommendation(state, managed, skip_preflight=skip_preflight)
+    tool = recommended_agent(recommendation, managed) or next(
+        iter(managed.get("enabled_agents") or {}), None
+    )
     if not isinstance(tool, str) or not tool:
         raise RuntimeError(
             "Your workspace's managed config names no agent to launch. Ask an admin to set a "
@@ -1610,6 +1704,7 @@ def _launch_managed_default(
         skip_preflight=skip_preflight,
         workspace=workspace,
         managed=managed,
+        recommendation=recommendation,
     )
 
 
