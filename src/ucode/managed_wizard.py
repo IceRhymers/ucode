@@ -3,9 +3,8 @@
 Workspace admins run this to build the ``CodingAgentConfig`` their developers will pull. It walks
 the admin through agents, per-agent models, tracing, MCP servers, skills, and a spend-routing budget
 policy, then writes the manifest to ``~/.ucode/managed-state.json`` (the one local managed-config
-file, owned by :mod:`ucode.managed_config`). An admin can try it with ``ucode --dry-run`` and then
-publish it to the workspace with ``ucode apply`` (a separate command, so the file can be reviewed
-first).
+file, owned by :mod:`ucode.managed_config`). Publishing it to the workspace is ``ucode apply`` (a
+separate command, so an admin can review the file first).
 
 Serialization, validation, and the per-agent model catalogs live in :mod:`ucode.managed_setup`; this
 module is the interaction layer on top of them. Sub-flows an admin already knows — tracing, MCP,
@@ -20,7 +19,6 @@ from pathlib import Path
 from typing import cast
 
 from ucode.agents import TOOL_SPECS, check_gateway_endpoint
-from ucode.config_io import is_dry_run
 from ucode.databricks import (
     ANTHROPIC_FAMILIES,
     all_users_can_use_schema,
@@ -936,7 +934,7 @@ def _delete_existing_config(workspace: str, token: str, existing: dict) -> None:
     """Delete the workspace's published config after confirming. Raises RuntimeError on failure.
 
     Deleting leaves the workspace with no managed config, so every developer falls back to their own
-    settings on their next ucode run — confirm before doing it, and honor ``--dry-run``.
+    settings on their next ucode run — confirm before doing it.
     """
     name = existing.get("name")
     if not isinstance(name, str):
@@ -950,9 +948,6 @@ def _delete_existing_config(workspace: str, token: str, existing: dict) -> None:
     )
     if not prompt_yes_no_default("Delete the existing managed config?", default=False):
         print_note("Nothing was deleted.")
-        return
-    if is_dry_run():
-        print_success("Dry run: the config was not deleted.")
         return
     with spinner("Deleting the managed config..."):
         delete_reason = delete_coding_agent_config(workspace, token, name)
@@ -998,23 +993,14 @@ def setup_from_file(path: str) -> int:
 
     save_managed_state(workspace, manifest)
     _render_summary(workspace, manifest)
-    if is_dry_run():
-        print_success(
-            f"Dry run: {manifest_path.name} was not written to ~/.ucode/managed-state.json."
-        )
-    else:
-        print_success(f"Saved to {manifest_path.name} -> ~/.ucode/managed-state.json")
-        _print_next_steps()
+    print_success(f"Saved to {manifest_path.name} -> ~/.ucode/managed-state.json")
+    _print_next_steps()
     return 0
 
 
 def _print_next_steps() -> None:
     console.print()
     print_heading("Next steps")
-    # The authored manifest is saved to the same local file a launch reads, so `ucode --dry-run`
-    # previews this machine's agents *as configured by the manifest* without fetching or overwriting
-    # it — a real local test of the config before it is published.
-    print_note("Try it locally:               ucode --dry-run")
     print_note("Publish it to the workspace:  ucode apply")
 
 
@@ -1056,8 +1042,7 @@ def setup_command(
     if not _handle_existing_config(workspace, token):
         return 0
 
-    # Discover the workspace's models and gateway URLs. This also logs in and persists local state,
-    # which is what lets the admin dry-run the config on their own machine afterwards.
+    # Discover the workspace's models and gateway URLs. This also logs in and persists local state.
     state = configure_shared_state(workspace, profile=profile, force_login=False)
     workspace = state.get("workspace") or workspace
     profile = state.get("profile") or profile
@@ -1159,11 +1144,8 @@ def setup_command(
     save_managed_state(workspace, manifest)
     _render_summary(workspace, manifest)
     console.print()
-    if is_dry_run():
-        print_success("Dry run: nothing was written to ~/.ucode/managed-state.json.")
-    else:
-        print_success("Saved to ~/.ucode/managed-state.json")
-        _print_next_steps()
+    print_success("Saved to ~/.ucode/managed-state.json")
+    _print_next_steps()
     return 0
 
 
