@@ -710,19 +710,20 @@ def _prompt_budget_policy(
         )
         return None
 
-    # Spend routing only works on a budget with a per-user threshold; without one the gateway reports
-    # no spend and every tier stays inert. The listing can't reveal the alert's action, so this hides
-    # the clearly-unusable budgets and the server rejects the rest on create.
-    usable = [budget for budget in budgets if budget.get("has_per_user_alert")]
+    # Spend routing only works on a budget with a per-user threshold that hard-blocks: without a
+    # per-user threshold the gateway reports no spend and every tier stays inert, and without a
+    # BLOCK_USAGE action the policy is never enforced (an email-only alert does not gate spend). The
+    # listing now exposes each alert's action, so hide the budgets that can't enforce routing.
+    usable = [budget for budget in budgets if budget.get("has_per_user_block")]
     if not usable:
         print_warning(
-            "None of this workspace's AI Gateway budgets have a per-user threshold configured, which "
-            "spend routing requires. Add a per-user alert threshold to a budget in the Databricks "
-            "console, then re-run `ucode setup`."
+            "None of this workspace's AI Gateway budgets have a per-user threshold with a usage "
+            "block configured, which spend routing enforces. Add a per-user alert threshold with a "
+            "block action to a budget in the Databricks console, then re-run `ucode setup`."
         )
         return None
     print_note(
-        "Showing only budgets with a per-user threshold configured, which spend routing needs."
+        "Showing only budgets with a per-user hard block configured, which spend routing enforces."
     )
 
     budget_id = prompt_for_selection(
@@ -737,6 +738,13 @@ def _prompt_budget_policy(
         return None
 
     policy: dict = {"budget_id": budget_id}
+    # Remember the budget's own name so the summary can show it beside the policy name. It's a local
+    # display aid only — `_budget_policy_payload` doesn't serialize it, so it never reaches the API.
+    budget_display_name = next(
+        (budget["display_name"] for budget in usable if budget["id"] == budget_id), ""
+    )
+    if budget_display_name:
+        policy["budget_display_name"] = budget_display_name
     display_name = prompt_for_text("Policy name", default="coding-agents-tiered-routing")
     if display_name:
         policy["display_name"] = display_name
@@ -848,8 +856,9 @@ def _render_summary(workspace: str, manifest: dict) -> None:
     if isinstance(policy, dict):
         tiers = policy.get("tiers") or []
         lines.append(
-            kv_line("Budget policy", policy.get("display_name") or policy.get("budget_id") or "set")
+            kv_line("Budget", policy.get("budget_display_name") or policy.get("budget_id") or "set")
         )
+        lines.append(kv_line("Policy name", policy.get("display_name") or "unnamed"))
         for tier in tiers:
             agent = tier.get("default_agent")
             display = TOOL_SPECS.get(agent, {}).get("display", agent)
