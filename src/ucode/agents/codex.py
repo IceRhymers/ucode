@@ -371,6 +371,14 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
     return state
 
 
+def _is_gpt_family(model: str) -> bool:
+    """Return True if this id is in the GPT family (versioned or OSS variants)."""
+    tail = model.split("/")[-1]
+    if tail.startswith("system.ai."):
+        tail = tail[len("system.ai.") :]
+    return tail.startswith("gpt-")
+
+
 def _managed_config_path() -> Path | None:
     """OS-level Codex managed config file, or None on unsupported platforms.
 
@@ -414,16 +422,14 @@ def _write_managed_config(
 
 
 def default_model(state: dict) -> str | None:
-    """Pick the newest GPT model when multiple are available.
+    """Pick the best available codex model.
 
-    A managed config's ``codex_default_model`` takes priority. The discovery list
-    is alphabetically sorted, which can put "databricks-gpt-5" ahead of
-    "databricks-gpt-5-5". Prefer the highest semantic version instead.
-
-    Only GPT-parseable ids are considered. Codex routes the chosen ``model``
-    through the gateway as-is, so a non-GPT entry (e.g. ``moonshotai/kimi-k2.5``)
-    would be rejected with a Unity Catalog endpoint-name error. When no
-    candidate parses as GPT we return None rather than pinning an unroutable id.
+    A managed config's ``codex_default_model`` takes priority. Among versioned
+    GPT ids (e.g. ``system.ai.gpt-5``, ``system.ai.gpt-5-6-luna``) the highest
+    semantic version wins. When no versioned GPT is present but other codex-family
+    ids are available (e.g. ``system.ai.gpt-oss-120b``), the first of those is
+    used — UC model-services only places ids in the codex bucket when they expose
+    the responses API, so any id there is routable.
     """
     if isinstance(state.get("codex_default_model"), str):
         return state.get("codex_default_model")
@@ -431,15 +437,21 @@ def default_model(state: dict) -> str | None:
     parsed: list[tuple[str, tuple[int, int | None, int | None, str]]] = [
         (mid, gpt) for mid in codex_models if (gpt := _parse_gpt(mid)) is not None
     ]
-    if not parsed:
-        return None
+    if parsed:
 
-    def _gpt_version_key(entry: tuple[str, tuple[int, int | None, int | None, str]]):
-        major, minor, patch, suffix = entry[1]
-        base_bonus = 1 if not suffix else 0
-        return (major, minor or 0, patch or 0, base_bonus)
+        def _gpt_version_key(entry: tuple[str, tuple[int, int | None, int | None, str]]):
+            major, minor, patch, suffix = entry[1]
+            base_bonus = 1 if not suffix else 0
+            return (major, minor or 0, patch or 0, base_bonus)
 
-    return max(parsed, key=_gpt_version_key)[0]
+        return max(parsed, key=_gpt_version_key)[0]
+
+    # No versioned GPT found. Fall back to the first GPT-family id (gpt-*
+    # after stripping the system.ai. prefix). gpt-oss-* models are confirmed
+    # routable through the responses API; non-GPT ids (e.g. moonshotai/kimi-k2.5)
+    # would be rejected by the gateway, so they stay excluded.
+    gpt_family = [m for m in codex_models if _is_gpt_family(m)]
+    return gpt_family[0] if gpt_family else None
 
 
 # codex rejects the global --profile on subcommands that don't accept it
