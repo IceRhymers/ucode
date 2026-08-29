@@ -642,7 +642,9 @@ def configure_shared_state(
     )
     want_gemini = fetch_all or "gemini" in tools or "opencode" in tools or "pi" in tools
     want_codex = fetch_all or "codex" in tools or "copilot" in tools or "pi" in tools
-    want_oss = fetch_all or "opencode" in tools
+    # Codex smart routing can select OSS models such as GLM, so a Codex-only
+    # configure must persist that discovered family too.
+    want_oss = fetch_all or "opencode" in tools or "codex" in tools
 
     claude_reason: str | None = None
     gemini_reason: str | None = None
@@ -1379,6 +1381,21 @@ def auth_token_cmd(
     sys.stdout.write(token + "\n")
 
 
+def _oauth_token_is_fresh(token: str, buffer_seconds: float = 120) -> bool:
+    import base64
+    import binascii
+    import json
+    import time
+
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        expires_at = float(json.loads(base64.urlsafe_b64decode(payload))["exp"])
+    except (IndexError, KeyError, TypeError, ValueError, binascii.Error, json.JSONDecodeError):
+        return False
+    return time.time() < expires_at - buffer_seconds
+
+
 @app.command("codex-router-hook", hidden=True)
 def codex_router_hook_cmd(
     event: str,
@@ -1433,14 +1450,16 @@ def codex_router_hook_cmd(
         return
     if event != "route-subagent" or not host:
         return
-    token = os.environ.get("OAUTH_TOKEN") or os.environ.get("DATABRICKS_BEARER")
+    if use_pat and not ensure_pat_bearer(profile):
+        return
+    token = os.environ.get("DATABRICKS_BEARER", "").strip()
     if not token:
-        if use_pat and not ensure_pat_bearer(profile):
-            return
-        try:
-            token = get_databricks_token(host, profile)
-        except RuntimeError:
-            return
+        token = os.environ.get("OAUTH_TOKEN", "").strip()
+        if not _oauth_token_is_fresh(token):
+            try:
+                token = get_databricks_token(host, profile, force_refresh=True)
+            except RuntimeError:
+                return
     output = route_pre_tool_use(
         payload,
         workspace=host,

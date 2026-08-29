@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 import os
 import re
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -27,6 +29,11 @@ def _strip_ansi(text: str) -> str:
 runner = CliRunner()
 
 TOOLS = ["codex", "claude", "gemini", "opencode"]
+
+
+def _jwt(expires_at: float) -> str:
+    payload = base64.urlsafe_b64encode(json.dumps({"exp": expires_at}).encode()).decode()
+    return f"header.{payload.rstrip('=')}.signature"
 
 
 @pytest.fixture(autouse=True)
@@ -297,10 +304,10 @@ class TestSubcommandRouting:
         assert result.exit_code == 0, result.output
         assert mock_configure.call_args.args[2] == "databricks-gpt-5-5"
         # The launch notice surfaces both the routed model and the rationale.
-        assert (
-            "Using Smart Routing. Routing to databricks-gpt-5-5. Cross-cutting refactor."
-            in _strip_ansi(result.output)
-        )
+        output = _strip_ansi(result.output)
+        assert "Using Unity Gateway Smart Router." in output
+        assert "Selected Model : databricks-gpt-5-5" in output
+        assert "Reason : Cross-cutting refactor." in output
 
     def test_claude_v2_skips_legacy_prelaunch_routing(self, monkeypatch):
         monkeypatch.setenv("ENABLE_SMART_ROUTING_V2", "1")
@@ -342,6 +349,77 @@ class TestSubcommandRouting:
         assert result.exit_code == 0, result.output
         assert result.output == ""
         mock_request.assert_not_called()
+
+    @staticmethod
+    def _invoke_codex_subagent_hook(token_env):
+        routed = {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "updatedInput": {"message": "fix it", "model": "gpt-5.6-sol"},
+            }
+        }
+        with (
+            patch("ucode.cli.get_databricks_token", return_value="fresh-token") as mock_token,
+            patch(
+                "ucode.smart_routing.codex_routing.route_pre_tool_use",
+                return_value=routed,
+            ) as mock_route,
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "codex-router-hook",
+                    "route-subagent",
+                    "--host",
+                    "https://example.com",
+                    "--profile",
+                    "my-profile",
+                    "--model",
+                    "system.ai.gpt-5-6-sol",
+                ],
+                input='{"tool_name":"collaboration.spawn_agent","tool_input":{"message":"fix it"}}',
+                env=token_env,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == routed
+        return mock_token, mock_route
+
+    def test_codex_subagent_hook_reuses_fresh_oauth_token(self, monkeypatch):
+        monkeypatch.delenv("DATABRICKS_BEARER", raising=False)
+        token = _jwt(time.time() + 300)
+
+        mock_token, mock_route = self._invoke_codex_subagent_hook({"OAUTH_TOKEN": token})
+
+        mock_token.assert_not_called()
+        assert mock_route.call_args.kwargs["token"] == token
+
+    def test_codex_subagent_hook_refreshes_near_expiry_oauth_token(self, monkeypatch):
+        monkeypatch.delenv("DATABRICKS_BEARER", raising=False)
+
+        mock_token, mock_route = self._invoke_codex_subagent_hook(
+            {"OAUTH_TOKEN": _jwt(time.time() + 90)}
+        )
+
+        mock_token.assert_called_once_with("https://example.com", "my-profile", force_refresh=True)
+        assert mock_route.call_args.kwargs["token"] == "fresh-token"
+
+    def test_codex_subagent_hook_refreshes_opaque_oauth_token(self, monkeypatch):
+        monkeypatch.delenv("DATABRICKS_BEARER", raising=False)
+
+        mock_token, mock_route = self._invoke_codex_subagent_hook({"OAUTH_TOKEN": "opaque-token"})
+
+        mock_token.assert_called_once_with("https://example.com", "my-profile", force_refresh=True)
+        assert mock_route.call_args.kwargs["token"] == "fresh-token"
+
+    def test_codex_subagent_hook_reuses_bearer(self):
+        mock_token, mock_route = self._invoke_codex_subagent_hook(
+            {"DATABRICKS_BEARER": "pat-token", "OAUTH_TOKEN": "opaque-token"}
+        )
+
+        mock_token.assert_not_called()
+        assert mock_route.call_args.kwargs["token"] == "pat-token"
 
     def test_claude_v2_subagent_hook_uses_v2_router(self, monkeypatch):
         monkeypatch.setenv("ENABLE_SMART_ROUTING_V2", "1")
@@ -2304,6 +2382,29 @@ class TestConfigureSharedStateUsePat:
         assert state["codex_models"] == ["system.ai.gpt-5"]
         assert legacy_called == []
         assert "uc_enabled" not in state
+
+    def test_codex_only_configure_persists_discovered_oss_models(self, monkeypatch):
+        cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_model_services",
+            lambda w, t: (
+                {},
+                ["system.ai.gpt-5-6-sol"],
+                [],
+                ["system.ai.glm-5-2"],
+                None,
+            ),
+        )
+
+        state = cli_mod.configure_shared_state(
+            self.WS,
+            profile="DEFAULT",
+            tools=["codex"],
+        )
+
+        assert state["codex_models"] == ["system.ai.gpt-5-6-sol"]
+        assert state["oss_models"] == ["system.ai.glm-5-2"]
 
     def _stub_with_fable(self, monkeypatch):
         cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
