@@ -162,11 +162,14 @@ def _resolve_web_search_model(state: dict) -> str | None:
 
 
 WEB_SEARCH_MCP_NAME = "web_search"
-# Matches both the AI Gateway form (`databricks-claude-opus-4-8`) and the UC
-# model-services form (`system.ai.claude-opus-4-8`).
-_CLAUDE_MODEL_RE = re.compile(
-    r"^(?:system\.ai\.)?(?:databricks-)?claude-(opus|sonnet)-(\d+)(?:-(\d+))?(.*)$"
-)
+# Matches the trailing model name — the leaf after the last `.` (see
+# `_maybe_add_1m_suffix`) — of both the AI Gateway form
+# (`databricks-claude-opus-4-8`) and any UC model-services form: `system.ai`
+# (`system.ai.claude-opus-4-8`) as well as a governed catalog's own schema
+# (`my_catalog.anthropic.claude-opus-4-8`). Matching the leaf gives a custom id
+# the `[1m]` suffix too (issue #234, #3) instead of silently losing 1M context.
+# The minor version is optional so single-number families (`claude-opus-5`) match.
+_CLAUDE_MODEL_RE = re.compile(r"^(?:databricks-)?claude-(opus|sonnet)-(\d+)(?:-(\d+))?(.*)$")
 
 # Env keys the MLflow Stop hook reads to route traces. Written into the
 # settings `env` block alongside the hook itself.
@@ -501,7 +504,11 @@ def render_overlay(
 def _maybe_add_1m_suffix(model: str) -> str:
     if model.endswith("[1m]"):
         return model
-    match = _CLAUDE_MODEL_RE.match(model)
+    # Match on the leaf model name so a catalog-qualified custom id
+    # (`my_catalog.anthropic.claude-opus-4-8`) is recognized, not just the
+    # `system.ai.`/`databricks-` forms.
+    leaf = model.rsplit(".", 1)[-1]
+    match = _CLAUDE_MODEL_RE.match(leaf)
     if not match:
         return model
 

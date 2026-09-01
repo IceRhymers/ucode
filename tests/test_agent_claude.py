@@ -142,6 +142,26 @@ class TestRenderOverlay:
         )
         assert overlay["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "system.ai.claude-haiku-4-6"
 
+    def test_adds_1m_suffix_for_custom_catalog_opus(self):
+        # A catalog-qualified custom id from `configure models --location` must get
+        # the [1m] suffix too, not just the system.ai/databricks- forms (issue #234).
+        overlay, _ = claude.render_overlay(
+            WS, "s4", claude_models={"opus": "my_catalog.anthropic.claude-opus-4-8"}
+        )
+        assert (
+            overlay["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"]
+            == "my_catalog.anthropic.claude-opus-4-8[1m]"
+        )
+
+    def test_no_1m_suffix_for_custom_catalog_haiku(self):
+        overlay, _ = claude.render_overlay(
+            WS, "s4", claude_models={"haiku": "my_catalog.anthropic.claude-haiku-4-8"}
+        )
+        assert (
+            overlay["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"]
+            == "my_catalog.anthropic.claude-haiku-4-8"
+        )
+
     def test_custom_model_pins_all_family_aliases(self):
         # `ucode claude --model` pins the id into every family alias so it takes effect whichever
         # slot Claude Code resolves — and NOT into ANTHROPIC_MODEL, which Claude Code validates and

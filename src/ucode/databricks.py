@@ -1853,6 +1853,269 @@ def discover_model_services(
     return claude_models, codex_models, gemini_models, oss_models, None
 
 
+# --- Opt-in custom-schema model discovery (`configure models --location`) ----
+#
+# `list_model_services` intentionally sees only `system.ai`. A governed catalog
+# can hold its own FMAPI-backed model services in per-provider schemas
+# (`<catalog>.anthropic`, `<catalog>.openai`) for per-schema permissions and
+# usage tracking; the gateway routes those catalog-qualified ids fine, but
+# neither discovery path surfaces them. These helpers add opt-in discovery of
+# such schemas, mirroring `configure mcp --location`. See issue #234.
+
+
+def _model_service_full_id(service: dict) -> str | None:
+    """Extract the full ``<catalog>.<schema>.<model>`` id from a model-service entry.
+
+    Unlike :func:`_model_service_id`, this keeps services in *any* schema — the
+    opt-in ``configure models --location`` discovery wants a governed catalog's
+    own model services, not just ``system.ai``."""
+    name = service.get("name")
+    if not isinstance(name, str):
+        return None
+    name = name.strip()
+    if name.startswith(_MODEL_SERVICE_NAME_PREFIX):
+        name = name[len(_MODEL_SERVICE_NAME_PREFIX) :]
+    return name or None
+
+
+def list_schema_model_service_ids(
+    workspace: str, token: str, location: str, *, max_pages: int = 100
+) -> tuple[list[str], str | None]:
+    """List every model-service id under one ``<catalog>.<schema>``.
+
+    Pages ``/api/2.1/unity-catalog/model-services`` scoped to
+    ``parent=schemas/<catalog>.<schema>`` (the same bounded, retrying pager
+    :func:`list_model_services` and :func:`model_service_exists` use) and returns
+    the de-duplicated, sorted list of full ``<catalog>.<schema>.<model>`` ids —
+    *without* the ``system.ai`` filter, so a governed catalog's own model
+    services come back.
+
+    Returns ``(ids, reason)``; ``reason`` is None on success, else why the list
+    is empty. A 404/NOT_FOUND reason means the catalog or schema doesn't exist on
+    this workspace. Never cached: it targets an opt-in user schema, not the
+    memoized ``system.ai`` walk.
+    """
+    parts = [part.strip() for part in location.split(".")]
+    if len(parts) != 2 or not all(parts):
+        return [], "a model location is named <catalog>.<schema>"
+    parent = f"schemas/{parts[0]}.{parts[1]}"
+    hostname = workspace_hostname(workspace)
+    ids: list[str] = []
+    page_token: str | None = None
+    seen_tokens: set[str] = set()
+    last_reason: str | None = None
+    for _ in range(max_pages):
+        params: dict[str, str] = {"parent": parent, "page_size": str(_MODEL_SERVICES_PAGE_SIZE)}
+        if page_token:
+            params["page_token"] = page_token
+        url = f"https://{hostname}/api/2.1/unity-catalog/model-services?{urlencode(params)}"
+        payload, reason = _get_model_services_page(url, token)
+        if payload is None:
+            last_reason = reason
+            break
+        data = cast(dict, payload) if isinstance(payload, dict) else {}
+        for service in data.get("model_services", []):
+            if isinstance(service, dict):
+                full_id = _model_service_full_id(service)
+                if full_id:
+                    ids.append(full_id)
+        page_token = data.get("next_page_token") or None
+        if not page_token:
+            last_reason = None
+            break
+        if page_token in seen_tokens:
+            break
+        seen_tokens.add(page_token)
+    deduped = sorted(set(ids))
+    if deduped:
+        return deduped, None
+    return [], last_reason or "model-services listing returned no models"
+
+
+# Each coding-agent family routes through exactly one gateway API dialect. The
+# platform reports a model service's dialects in `supported_api_types`, but only
+# on the singular GET (see `fetch_supported_api_types`), never in the LIST. A
+# custom service whose NAME buckets to a family but whose destination doesn't
+# expose the matching dialect would 400 at inference time, not configure time;
+# `configure models` fetches these to warn early. Values verified against a live
+# gateway (unity-gateway-setup terraform state, 2026-08).
+_FAMILY_REQUIRED_API_TYPE: dict[str, str] = {
+    "claude": "anthropic/v1/messages",
+    "codex": "openai/v1/responses",
+    "gemini": "gemini/v1/generateContent",
+    "oss": "mlflow/v1/chat/completions",
+}
+
+
+def required_api_type_for_family(family: str | None) -> str | None:
+    """The ``supported_api_types`` value a service must expose to serve ``family``.
+
+    ``family`` is a value from :func:`classify_model_family` (any Claude family
+    collapses to ``claude``). None when the family has no known dialect
+    requirement, or ``family`` is None."""
+    if family is None:
+        return None
+    if family in ANTHROPIC_FAMILIES:
+        family = "claude"
+    return _FAMILY_REQUIRED_API_TYPE.get(family)
+
+
+_MODEL_SERVICE_GET_PATH = "/api/2.1/unity-catalog/model-services/"
+
+
+def fetch_supported_api_types(
+    workspace: str, token: str, full_names: list[str], *, max_workers: int = 8
+) -> dict[str, list[str]]:
+    """Map each model-service full name -> its ``supported_api_types``.
+
+    ``supported_api_types`` is computed by the platform per underlying model and
+    is only returned on a single-object GET (not in the LIST), so this fans out
+    one GET per service — mirroring unity-gateway-setup's ``discover_api_types``.
+    Best effort: a name whose GET fails maps to ``[]``, so a transient blip
+    degrades to "capabilities unknown" rather than failing discovery. Bound the
+    input to the services you actually care about (e.g. the custom-location
+    bucketed subset) — it is one round trip each.
+    """
+    if not full_names:
+        return {}
+    hostname = workspace_hostname(workspace)
+
+    def one(full_name: str) -> tuple[str, list[str]]:
+        url = f"https://{hostname}{_MODEL_SERVICE_GET_PATH}{quote(full_name)}"
+        payload, _reason = _http_get_json(url, token, timeout=30)
+        if isinstance(payload, dict):
+            types = payload.get("supported_api_types")
+            if isinstance(types, list):
+                return full_name, [t for t in types if isinstance(t, str)]
+        return full_name, []
+
+    results: dict[str, list[str]] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for full_name, types in pool.map(one, full_names):
+            results[full_name] = types
+    return results
+
+
+def _model_numeric_version(model_id: str) -> tuple[int, int, int]:
+    """The dotted version embedded in a model id as a 3-tuple, ``(0, 0, 0)`` if none.
+
+    ``<cat>.<schema>.claude-opus-4-8`` -> ``(4, 8, 0)``. Used to pick the newest
+    model within one discovery source; cross-source precedence is separate."""
+    tokens = model_id.split("-")
+    start = next((i for i, tok in enumerate(tokens) if tok.isdigit()), None)
+    if start is None:
+        return (0, 0, 0)
+    end = start
+    while end < len(tokens) and tokens[end].isdigit():
+        end += 1
+    version = tuple(int(tok) for tok in tokens[start:end])
+    return cast("tuple[int, int, int]", (version + (0, 0, 0))[:3])
+
+
+class LocationDiscovery(NamedTuple):
+    """Family buckets from merging ``system.ai`` with opt-in ``configure models`` locations."""
+
+    claude: dict[str, str]
+    codex: list[str]
+    gemini: list[str]
+    oss: list[str]
+    skipped: list[str]  # custom-location ids whose name matched no family
+    custom_bucketed: dict[str, str]  # custom full_id -> family, for dialect checks
+    reason: str | None
+    location_errors: dict[str, str]  # location -> why its listing came back empty
+
+
+def discover_model_services_across_locations(
+    workspace: str, token: str, locations: list[str]
+) -> LocationDiscovery:
+    """Discover + bucket model services from ``system.ai`` plus opt-in ``locations``.
+
+    Each entry in ``locations`` is a ``<catalog>.<schema>`` listed via
+    ``parent=schemas/<catalog>.<schema>``. Discovered ids merge with the
+    ``system.ai`` walk under an explicit precedence (issue #234): an opt-in
+    location beats ``system.ai``, and a later ``--location`` beats an earlier one,
+    for the single-slot Claude family aliases. Within one source the newest
+    version wins. ``codex``/``gemini``/``oss`` are lists (location ids first, then
+    newest-first) since their agents pick from the whole list.
+
+    - ``skipped`` lists custom-location ids whose *name* matched no family
+      (free-form names like ``cheap-coder`` can't bucket by substring).
+    - ``custom_bucketed`` maps each custom (non-``system.ai``) id that DID land in
+      a returned bucket to its family, so the caller can check
+      ``supported_api_types`` on just that subset.
+    - ``location_errors`` records, per location, why its listing came back empty
+      (e.g. the schema doesn't exist) — best effort, never fatal.
+    """
+    system_ids, reason = list_model_services(workspace, token)
+
+    ranked: list[tuple[int, str]] = [(0, i) for i in system_ids]
+    location_errors: dict[str, str] = {}
+    custom_ids: set[str] = set()
+    for rank, location in enumerate(locations, start=1):
+        loc_ids, loc_reason = list_schema_model_service_ids(workspace, token, location)
+        if loc_reason is not None:
+            location_errors[location] = loc_reason
+        for i in loc_ids:
+            ranked.append((rank, i))
+            custom_ids.add(i)
+
+    # Claude: one slot per family. Higher rank wins outright (a location over
+    # system.ai, a later location over an earlier one); ties break by newest
+    # version. This replaces the reverse-string sort, which effectively picked
+    # alphabetically by catalog once custom locations existed (issue #234, #2).
+    claude_models: dict[str, str] = {}
+    for family in ANTHROPIC_FAMILIES:
+        candidates = [(r, i) for (r, i) in ranked if f"claude-{family}-" in i]
+        if candidates:
+            best = max(candidates, key=lambda ri: (ri[0], _model_numeric_version(ri[1])))
+            claude_models[family] = best[1]
+    _prefer_opus_4_8(claude_models, [i for _, i in ranked])
+
+    def _list_for(match: Callable[[str], bool]) -> list[str]:
+        # Location ids first (higher rank), newest-first within a rank; de-duped.
+        matched = [(r, i) for (r, i) in ranked if match(i)]
+        matched.sort(key=lambda ri: (-ri[0], model_version_sort_key(ri[1])))
+        out: list[str] = []
+        for _, i in matched:
+            if i not in out:
+                out.append(i)
+        return out
+
+    codex_models = _list_for(lambda i: "gpt-" in i)
+    gemini_models = _list_for(lambda i: "gemini-" in i)
+    oss_models = _list_for(lambda i: any(fam in i for fam in _OSS_MODEL_FAMILIES))
+
+    # Custom ids that actually landed in a returned bucket (for dialect checks),
+    # and custom ids that matched no family at all (reported as skipped).
+    bucketed = (
+        set(claude_models.values()) | set(codex_models) | set(gemini_models) | set(oss_models)
+    )
+    custom_bucketed: dict[str, str] = {}
+    for i in sorted(bucketed & custom_ids):
+        family = classify_model_family(i)
+        if family is not None:
+            custom_bucketed[i] = family
+    skipped = sorted(i for i in custom_ids if classify_model_family(i) is None)
+
+    have_any = bool(claude_models or codex_models or gemini_models or oss_models)
+    if have_any:
+        # A location supplied models even if the system.ai walk came back empty.
+        reason = None
+    elif reason is None:
+        reason = "model-services listing returned no models"
+
+    return LocationDiscovery(
+        claude=claude_models,
+        codex=codex_models,
+        gemini=gemini_models,
+        oss=oss_models,
+        skipped=skipped,
+        custom_bucketed=custom_bucketed,
+        reason=reason,
+        location_errors=location_errors,
+    )
+
+
 # --- Managed coding-agent config (admin-authored, developer-read) -----------
 
 # The workspace-admin authors a CodingAgentConfig via the AI Gateway; developers read it

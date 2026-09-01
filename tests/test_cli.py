@@ -12,12 +12,14 @@ import time
 import tomllib
 from importlib import metadata
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
 from typer.testing import CliRunner
 
 import ucode.databricks as db_mod
+from ucode import cli as cli_module
 from ucode.cli import app
 from ucode.databricks import GatewayProbe
 
@@ -1184,6 +1186,112 @@ class TestStatus:
 
         assert result.exit_code == 0, result.output
         assert "Workspace-managed config" not in result.output
+
+
+class TestParseModelLocations:
+    def test_repeatable_and_comma_forms(self):
+        from ucode.cli import _parse_model_locations
+
+        assert _parse_model_locations(["a.b", "c.d"]) == ["a.b", "c.d"]
+        assert _parse_model_locations(["a.b,c.d"]) == ["a.b", "c.d"]
+        assert _parse_model_locations(["a.b", "a.b, e.f"]) == ["a.b", "e.f"]  # de-duped
+        assert _parse_model_locations(None) == []
+
+    def test_rejects_non_schema_ref(self):
+        from ucode.cli import _parse_model_locations
+
+        with pytest.raises(RuntimeError):
+            _parse_model_locations(["justacatalog"])
+        with pytest.raises(RuntimeError):
+            _parse_model_locations(["a.b.c"])
+
+
+class TestConfigureModelsCommand:
+    WS = "https://example.databricks.com"
+
+    def test_repeated_location_dispatches(self):
+        with patch("ucode.cli.configure_models_command") as mock_cmd:
+            result = runner.invoke(
+                app,
+                ["configure", "models", "--location", "cat.anthropic", "--location", "cat.openai"],
+            )
+        assert result.exit_code == 0, result.output
+        mock_cmd.assert_called_once_with(["cat.anthropic", "cat.openai"], clear=False)
+
+    def test_comma_location_dispatches(self):
+        with patch("ucode.cli.configure_models_command") as mock_cmd:
+            result = runner.invoke(app, ["configure", "models", "--location", "cat.a,cat.b"])
+        assert result.exit_code == 0, result.output
+        mock_cmd.assert_called_once_with(["cat.a", "cat.b"], clear=False)
+
+    def test_clear_dispatches(self):
+        with patch("ucode.cli.configure_models_command") as mock_cmd:
+            result = runner.invoke(app, ["configure", "models", "--clear"])
+        assert result.exit_code == 0, result.output
+        mock_cmd.assert_called_once_with([], clear=True)
+
+    def test_location_and_clear_is_error(self):
+        with patch("ucode.cli.configure_models_command") as mock_cmd:
+            result = runner.invoke(app, ["configure", "models", "--location", "a.b", "--clear"])
+        assert result.exit_code == 1
+        mock_cmd.assert_not_called()
+
+    def test_bad_location_is_error(self):
+        with patch("ucode.cli.configure_models_command") as mock_cmd:
+            result = runner.invoke(app, ["configure", "models", "--location", "nope"])
+        assert result.exit_code == 1
+        mock_cmd.assert_not_called()
+
+    def test_no_workspace_raises(self):
+        with patch("ucode.cli.load_state", return_value={}):
+            with pytest.raises(RuntimeError, match="No workspace configured"):
+                cli_module.configure_models_command(["cat.anthropic"])
+
+    def test_setting_locations_persists_and_reconfigures(self):
+        saved: dict = {}
+        state = {"workspace": self.WS, "profile": "p", "available_tools": ["claude", "cursor"]}
+        disc = SimpleNamespace(
+            claude={"opus": "cat.anthropic.claude-opus-4-8"},
+            codex=[],
+            gemini=[],
+            oss=[],
+            skipped=[],
+            custom_bucketed={"cat.anthropic.claude-opus-4-8": "opus"},
+            reason=None,
+            location_errors={},
+        )
+        with (
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.save_state", side_effect=lambda s: saved.update(s)),
+            patch("ucode.cli.get_databricks_token", return_value="tok"),
+            patch("ucode.cli.discover_model_services_across_locations", return_value=disc),
+            patch(
+                "ucode.cli.fetch_supported_api_types",
+                return_value={"cat.anthropic.claude-opus-4-8": ["anthropic/v1/messages"]},
+            ),
+            patch("ucode.cli.configure_workspace_command") as mock_cfg,
+        ):
+            cli_module.configure_models_command(["cat.anthropic"])
+
+        assert saved["model_locations"] == ["cat.anthropic"]
+        # cursor (MCP-only) is filtered out of the reconfigure.
+        _, kwargs = mock_cfg.call_args
+        assert kwargs["selected_tools"] == ["claude"]
+        assert kwargs["workspaces"] == [(self.WS, "p")]
+
+    def test_clear_with_no_agents_skips_reconfigure(self):
+        saved: dict = {}
+        state = {"workspace": self.WS, "profile": "p", "model_locations": ["cat.x"]}
+        with (
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.save_state", side_effect=lambda s: saved.update(s)),
+            patch("ucode.cli.get_databricks_token", return_value="tok"),
+            patch("ucode.cli.configure_workspace_command") as mock_cfg,
+        ):
+            cli_module.configure_models_command([], clear=True)
+
+        assert saved["model_locations"] == []
+        mock_cfg.assert_not_called()
 
 
 class TestConfigureSkillsCommand:

@@ -48,8 +48,10 @@ from ucode.databricks import (
     discover_codex_models,
     discover_gemini_models,
     discover_model_services,
+    discover_model_services_across_locations,
     ensure_databricks_auth,
     ensure_pat_bearer,
+    fetch_supported_api_types,
     find_profile_name_for_host,
     get_databricks_profiles,
     get_databricks_token,
@@ -60,6 +62,7 @@ from ucode.databricks import (
     list_tool_provider_services,
     normalize_workspace_url,
     probe_unity_gateway_capabilities,
+    required_api_type_for_family,
     resolve_pat_token,
     resolve_provider_launch_model,
     run_databricks_login,
@@ -443,6 +446,25 @@ def _parse_skill_locations(location: str | None) -> list[str]:
     return locations
 
 
+def _parse_model_locations(location: list[str] | None) -> list[str]:
+    """Parse repeatable, comma-separated `--location` values into `<catalog>.<schema>`
+    refs, dropping duplicates while preserving order. Accepts both
+    `--location a.b --location c.d` and `--location a.b,c.d`. `None`/empty yields
+    `[]`. Raises `RuntimeError` on a value that isn't `<catalog>.<schema>`."""
+    locations: list[str] = []
+    for entry in location or []:
+        for raw in entry.split(","):
+            raw = raw.strip()
+            if not raw:
+                continue
+            parts = raw.split(".")
+            if len(parts) != 2 or not all(part.strip() for part in parts):
+                raise RuntimeError(f"--location entries must be `<catalog>.<schema>`, got `{raw}`.")
+            if raw not in locations:
+                locations.append(raw)
+    return locations
+
+
 def _parse_workspaces_option(workspaces: str) -> list[tuple[str, str | None]]:
     """Parse `--workspaces` into [(url, profile_name | None), ...].
 
@@ -681,10 +703,24 @@ def configure_shared_state(
         # back empty (workspace without UC model-services, or the listing
         # failed), fall back to the per-family AI Gateway listing for that
         # family only.
+        model_locations = state.get("model_locations") or []
         with spinner("Fetching available models..."):
-            ms_claude, ms_codex, ms_gemini, ms_oss, ms_reason = discover_model_services(
-                workspace, token
-            )
+            if model_locations:
+                # Opt-in `configure models --location` schemas are folded into the
+                # same buckets alongside `system.ai`, with a location winning over
+                # `system.ai` for a family (see discover_model_services_across_locations).
+                _disc = discover_model_services_across_locations(workspace, token, model_locations)
+                ms_claude, ms_codex, ms_gemini, ms_oss, ms_reason = (
+                    _disc.claude,
+                    _disc.codex,
+                    _disc.gemini,
+                    _disc.oss,
+                    _disc.reason,
+                )
+            else:
+                ms_claude, ms_codex, ms_gemini, ms_oss, ms_reason = discover_model_services(
+                    workspace, token
+                )
             if want_claude:
                 claude_models, claude_reason = ms_claude, ms_reason
                 if not claude_models:
@@ -3155,6 +3191,159 @@ def configure_tracing(
     try:
         install_databricks_cli()
         configure_tracing_command(disable=disable)
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130) from None
+
+
+def _warn_model_location_issues(workspace: str, token: str, disc) -> None:
+    """Surface a custom-location discovery's problems: schemas that didn't list,
+    names that couldn't bucket, and bucketed services whose gateway dialect
+    doesn't match the family they routed to (a `supported_api_types` check)."""
+    for location, reason in disc.location_errors.items():
+        print_warning(f"Location `{location}` returned no models: {reason}")
+    if disc.skipped:
+        print_note(
+            "Skipped model service(s) whose name matches no known family "
+            f"(claude-*/gpt-*/gemini-* or an OSS family): {', '.join(disc.skipped)}. "
+            "Rename them to a recognized family to route them automatically."
+        )
+    if not disc.custom_bucketed:
+        return
+    with spinner("Checking model capabilities..."):
+        api_types = fetch_supported_api_types(workspace, token, sorted(disc.custom_bucketed))
+    for full_id, family in sorted(disc.custom_bucketed.items()):
+        required = required_api_type_for_family(family)
+        types = api_types.get(full_id) or []
+        # Empty types means the capability GET failed — capabilities unknown, so
+        # stay quiet rather than cry wolf on a transient blip.
+        if required and types and required not in types:
+            print_warning(
+                f"`{full_id}` is bucketed as {family} but its service exposes "
+                f"[{', '.join(types)}] — not `{required}`. Requests will fail at "
+                "inference time; point the service at a compatible destination."
+            )
+
+
+def _report_model_locations(workspace: str, token: str, current: list[str]) -> None:
+    """Print the persisted opt-in locations and what they discover (status only)."""
+    if not current:
+        print_note("No opt-in model locations configured — discovering system.ai only.")
+        print_note("Add one with `ucode configure models --location <catalog>.<schema>`.")
+        return
+    print_section(f"Model locations: {', '.join(current)}")
+    with spinner("Discovering models..."):
+        disc = discover_model_services_across_locations(workspace, token, current)
+    for label, value in (
+        ("claude", ", ".join(f"{fam}={mid}" for fam, mid in sorted(disc.claude.items()))),
+        ("codex", ", ".join(disc.codex)),
+        ("gemini", ", ".join(disc.gemini)),
+        ("oss", ", ".join(disc.oss)),
+    ):
+        print_kv(label, value or "none")
+    _warn_model_location_issues(workspace, token, disc)
+
+
+def configure_models_command(
+    locations: list[str] | None = None,
+    *,
+    clear: bool = False,
+) -> None:
+    """Set the opt-in model-discovery locations, re-discover, and reconfigure agents.
+
+    - ``clear=True`` forgets all locations (reverts to ``system.ai`` only).
+    - ``locations`` (a validated ``<catalog>.<schema>`` list) replaces the persisted
+      set; discovered models fold into every configured agent's config, with a
+      location winning over ``system.ai`` for a family.
+    - Neither: prints the current locations and what they discover (status only).
+    """
+    state = load_state()
+    workspace = state.get("workspace")
+    if not workspace:
+        raise RuntimeError("No workspace configured. Run `ucode configure` first.")
+    profile = state.get("profile")
+    token = get_databricks_token(workspace, profile)
+
+    current = list(state.get("model_locations") or [])
+    if not clear and not locations:
+        _report_model_locations(workspace, token, current)
+        return
+
+    new_locations = [] if clear else (locations or [])
+    state["model_locations"] = new_locations
+    save_state(state)
+
+    if new_locations:
+        print_success(f"Model locations set: {', '.join(new_locations)}")
+    else:
+        print_success("Model locations cleared — discovering system.ai only.")
+
+    # Report discovery health (missing schemas, unbucketable names, dialect
+    # mismatches) before rewriting configs, so the warnings sit next to the change.
+    if new_locations:
+        with spinner("Discovering models..."):
+            disc = discover_model_services_across_locations(workspace, token, new_locations)
+        if disc.reason:
+            print_warning(f"Model discovery: {disc.reason}")
+        _warn_model_location_issues(workspace, token, disc)
+
+    # Rewrite the already-configured model agents' configs so the new models take
+    # effect without re-running `ucode configure` per agent. The re-discovery
+    # inside configure_shared_state reads the model_locations just persisted.
+    configured = [
+        t for t in (state.get("available_tools") or []) if t in TOOL_SPECS and t != "cursor"
+    ]
+    if not configured:
+        print_note(
+            "No coding agents configured yet — locations apply on the next `ucode configure`."
+        )
+        return
+    configure_workspace_command(
+        selected_tools=configured,
+        workspaces=[(workspace, profile)],
+        prompt_optional_updates=False,
+        skip_validate=True,
+        skip_unavailable=True,
+    )
+
+
+@configure_app.command("models")
+def configure_models(
+    location: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--location",
+            help="Opt-in Unity Catalog `<catalog>.<schema>` to discover model services in, "
+            "beyond `system.ai`. Repeatable and comma-separated (`--location cat.anthropic "
+            "--location cat.openai`). Discovered models are bucketed by name "
+            "(claude-*/gpt-*/gemini-* and OSS families) and folded into every configured "
+            "agent; a location wins over `system.ai` for a family, and a later `--location` "
+            "wins over an earlier one. Persisted, so future `ucode configure` runs keep "
+            "discovering them.",
+        ),
+    ] = None,
+    clear: Annotated[
+        bool,
+        typer.Option(
+            "--clear",
+            help="Forget all opt-in model locations (revert to discovering `system.ai` only).",
+        ),
+    ] = False,
+) -> None:
+    """Discover model services from your own catalog schemas, not just `system.ai`.
+
+    With no options, prints the current locations and the models they discover. With
+    ``--location``, sets the locations (replacing any prior set), re-discovers, and
+    reconfigures your agents. ``--clear`` reverts to `system.ai` only.
+    """
+    try:
+        if location and clear:
+            raise RuntimeError("Use either --location or --clear, not both.")
+        locations = _parse_model_locations(location)
+        configure_models_command(locations, clear=clear)
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None

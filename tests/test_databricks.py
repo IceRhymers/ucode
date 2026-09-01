@@ -437,6 +437,188 @@ class TestDiscoverModelServices:
         assert calls["n"] == 3  # two failures, third succeeds
 
 
+def _services_payload(ids: list[str]) -> dict:
+    return {"model_services": [_model_service(i) for i in ids]}
+
+
+class TestListSchemaModelServiceIds:
+    def test_returns_full_ids_without_system_ai_filter(self, monkeypatch):
+        payload = _services_payload(
+            ["my_cat.anthropic.claude-opus-4-8", "my_cat.anthropic.cheap-coder"]
+        )
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=30: (payload, None)
+        )
+
+        ids, reason = db_mod.list_schema_model_service_ids(WS, "tok", "my_cat.anthropic")
+
+        assert reason is None
+        assert ids == ["my_cat.anthropic.cheap-coder", "my_cat.anthropic.claude-opus-4-8"]
+
+    def test_rejects_malformed_location(self):
+        ids, reason = db_mod.list_schema_model_service_ids(WS, "tok", "not-a-schema")
+        assert ids == []
+        assert reason is not None
+
+    def test_surfaces_404_reason(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token, timeout=30: (None, "HTTP 404 not_found"),
+        )
+        ids, reason = db_mod.list_schema_model_service_ids(WS, "tok", "gone.schema")
+        assert ids == []
+        assert reason == "HTTP 404 not_found"
+
+
+class TestFetchSupportedApiTypes:
+    def test_maps_names_to_types(self, monkeypatch):
+        types = {
+            "cat.openai.gpt-5": ["openai/v1/responses"],
+            "cat.anthropic.claude-opus-4-8": ["anthropic/v1/messages"],
+        }
+
+        def fake_get(url, token, timeout=30):
+            full = url.split("/model-services/")[1]
+            return {"supported_api_types": types.get(full, [])}, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+        result = db_mod.fetch_supported_api_types(WS, "tok", list(types))
+        assert result == types
+
+    def test_failed_get_maps_to_empty_list(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=30: (None, "HTTP 500")
+        )
+        result = db_mod.fetch_supported_api_types(WS, "tok", ["cat.openai.gpt-5"])
+        assert result == {"cat.openai.gpt-5": []}
+
+    def test_empty_input_is_a_noop(self, monkeypatch):
+        # Never touches the network.
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not be called")),
+        )
+        assert db_mod.fetch_supported_api_types(WS, "tok", []) == {}
+
+
+class TestRequiredApiTypeForFamily:
+    def test_families_map_to_dialects(self):
+        assert db_mod.required_api_type_for_family("opus") == "anthropic/v1/messages"
+        assert db_mod.required_api_type_for_family("sonnet") == "anthropic/v1/messages"
+        assert db_mod.required_api_type_for_family("codex") == "openai/v1/responses"
+        assert db_mod.required_api_type_for_family("gemini") == "gemini/v1/generateContent"
+        assert db_mod.required_api_type_for_family("oss") == "mlflow/v1/chat/completions"
+
+    def test_unknown_family_is_none(self):
+        assert db_mod.required_api_type_for_family(None) is None
+        assert db_mod.required_api_type_for_family("nonsense") is None
+
+
+class TestDiscoverModelServicesAcrossLocations:
+    def _route(self, system_ids, loc_map, api_types=None):
+        """Fake _http_get_json routing by URL: parent-scoped LISTs, plus singular
+        model-service GETs for supported_api_types."""
+        api_types = api_types or {}
+
+        def fake_get(url, token, timeout=30):
+            if "/model-services/" in url and "?" not in url:  # singular GET
+                full = url.split("/model-services/")[1]
+                return {"supported_api_types": api_types.get(full, [])}, None
+            if "system.ai" in url:
+                return _services_payload(system_ids), None
+            for loc, ids in loc_map.items():
+                if loc in url:  # `<catalog>.<schema>` appears in the encoded parent
+                    return _services_payload(ids), None
+            return {"model_services": []}, None
+
+        return fake_get
+
+    def test_location_beats_system_ai_even_when_older(self, monkeypatch):
+        db_mod.clear_model_services_cache()
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            self._route(
+                ["system.ai.claude-sonnet-5"],
+                {"cat.anthropic": ["cat.anthropic.claude-sonnet-4-6"]},
+            ),
+        )
+        disc = db_mod.discover_model_services_across_locations(WS, "tok", ["cat.anthropic"])
+        assert disc.claude["sonnet"] == "cat.anthropic.claude-sonnet-4-6"
+        assert disc.reason is None
+
+    def test_later_location_beats_earlier(self, monkeypatch):
+        db_mod.clear_model_services_cache()
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            self._route(
+                [],
+                {
+                    "cat.a": ["cat.a.claude-opus-4-6"],
+                    "cat.b": ["cat.b.claude-opus-4-7"],
+                },
+            ),
+        )
+        disc = db_mod.discover_model_services_across_locations(WS, "tok", ["cat.a", "cat.b"])
+        assert disc.claude["opus"] == "cat.b.claude-opus-4-7"
+
+    def test_codex_lists_location_ids_first(self, monkeypatch):
+        db_mod.clear_model_services_cache()
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            self._route(
+                ["system.ai.gpt-5"],
+                {"cat.openai": ["cat.openai.gpt-5-2"]},
+            ),
+        )
+        disc = db_mod.discover_model_services_across_locations(WS, "tok", ["cat.openai"])
+        assert disc.codex == ["cat.openai.gpt-5-2", "system.ai.gpt-5"]
+
+    def test_skips_unbucketable_names_and_maps_custom_bucketed(self, monkeypatch):
+        db_mod.clear_model_services_cache()
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            self._route(
+                [],
+                {
+                    "cat.anthropic": [
+                        "cat.anthropic.claude-opus-4-8",
+                        "cat.anthropic.cheap-coder",
+                    ],
+                    "cat.openai": ["cat.openai.gpt-5-2"],
+                },
+            ),
+        )
+        disc = db_mod.discover_model_services_across_locations(
+            WS, "tok", ["cat.anthropic", "cat.openai"]
+        )
+        assert disc.skipped == ["cat.anthropic.cheap-coder"]
+        assert disc.custom_bucketed == {
+            "cat.anthropic.claude-opus-4-8": "opus",
+            "cat.openai.gpt-5-2": "codex",
+        }
+
+    def test_location_listing_failure_is_recorded_not_fatal(self, monkeypatch):
+        db_mod.clear_model_services_cache()
+
+        def fake_get(url, token, timeout=30):
+            if "system.ai" in url:
+                return _services_payload(["system.ai.claude-opus-4-8"]), None
+            return None, "HTTP 404 not_found"
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+        disc = db_mod.discover_model_services_across_locations(WS, "tok", ["gone.schema"])
+        assert disc.location_errors == {"gone.schema": "HTTP 404 not_found"}
+        # system.ai still discovered.
+        assert disc.claude["opus"] == "system.ai.claude-opus-4-8"
+        assert disc.reason is None
+
+
 class TestModelServiceExists:
     def test_true_when_listed_in_its_schema(self, monkeypatch):
         urls: list[str] = []
