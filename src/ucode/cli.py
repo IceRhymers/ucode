@@ -74,6 +74,7 @@ from ucode.managed_config import (
     refresh_managed_config,
 )
 from ucode.managed_resolve import (
+    managed_claude_family_models,
     managed_default_model,
     managed_enabled_tools,
     managed_launch_model,
@@ -2017,6 +2018,11 @@ def _launch_tool(
         # or Foundry service), and, for Bedrock, expose Claude models to pin.
         provider_models = None
         relayed = False
+        coding_agent_config_defaults = (
+            managed_claude_family_models(managed) or {}
+            if tool == "claude" and managed is not None
+            else {}
+        )
         if provider:
             provider_models, error, relayed = resolve_provider_models(tool, state, provider)
             if error:
@@ -2040,6 +2046,7 @@ def _launch_tool(
                 authored = managed_provider_family_models(managed)
                 if authored:
                     provider_models = authored
+                    coding_agent_config_defaults = authored
         # The router's per-launch pick for the root session. Codex pins it as the
         # resolved model; claude pins it via ANTHROPIC_MODEL (route_root_model).
         route_root_model = None
@@ -2088,6 +2095,7 @@ def _launch_tool(
             # the latter pins a raw id into every family alias, which would clobber the service's
             # per-family target pins.
             custom_model=model if (tool == "claude" and not provider) else None,
+            coding_agent_config_defaults=coding_agent_config_defaults,
         )
         # Relayed = a Claude subscription: forward --model to Claude Code's own flag, like `-- --model X`.
         if tool == "claude" and provider and relayed and model and not forwarded_model:
