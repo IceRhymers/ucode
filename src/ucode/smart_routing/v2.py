@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -50,6 +51,10 @@ CLAUDE_ROUTED_AGENT_PROMPT = (
     "Complete the delegated task exactly as requested. Follow the parent agent's instructions and "
     "return a concise report of your findings or changes."
 )
+# Keep this pattern in sync with the server-side Anthropic model prefixing logic. The prefix is
+# needed because Anthropic omits models from its catalog unless the model id contains "anthropic"
+# or "claude".
+_ANTHROPIC_AIGW_MODEL_RE = re.compile(r"^anthropic-aigw-[0-9a-fA-F]{8}-(.+)$")
 
 
 def enabled() -> bool:
@@ -105,6 +110,13 @@ def _canonical_claude_models(model_ids: list[str]) -> list[str]:
             if isinstance(model, str) and model
         )
     )
+
+
+def _claude_router_model_id(model: str) -> str:
+    """Unwrap an Anthropic gateway id, then apply standard model normalization."""
+    if match := _ANTHROPIC_AIGW_MODEL_RE.fullmatch(model):
+        model = match.group(1)
+    return routing.normalize_model(model)
 
 
 def _claude_model_overrides(model_ids: list[str]) -> dict[str, str]:
@@ -182,14 +194,15 @@ def _request_claude_routing_decision(
 ) -> tuple[routing.RoutingDecision | None, str | None]:
     available: dict[str, str] = {}
     for model in _canonical_claude_models(model_ids):
-        available.setdefault(routing.normalize_model(model), model)
+        available.setdefault(_claude_router_model_id(model), model)
     if not available:
         return None, "Anthropic models endpoint returned no Claude models"
+    route_options = [(model, "claude") for model in available]
     return routing.select_route(
         workspace,
         token,
         prompt,
-        [(model, "claude") for model in available],
+        route_options,
         lambda selected: available.get(routing.normalize_model(selected)),
         router_name=routing.configured_router_name(),
         timeout=CLAUDE_ROUTE_SELECTION_TIMEOUT_S,
