@@ -462,15 +462,17 @@ class TestInterposerSession:
 
 
 def test_routing_request_uses_models_prompt_and_same_token(monkeypatch):
+    monkeypatch.delenv("SMART_ROUTER_NAME", raising=False)
     captured = {}
     logged = []
 
-    def select_route(workspace, token, task, route_options, resolve, *, timeout):
+    def select_route(workspace, token, task, route_options, resolve, *, router_name, timeout):
         captured.update(
             workspace=workspace,
             token=token,
             task=task,
             route_options=list(route_options),
+            router_name=router_name,
             timeout=timeout,
         )
         return (
@@ -503,6 +505,7 @@ def test_routing_request_uses_models_prompt_and_same_token(monkeypatch):
         "workspace": WS,
         "token": "same-oauth-token",
         "task": "Fix the parser",
+        "router_name": "task_v1",
         "timeout": codex_routing.REQUEST_TIMEOUT_S,
         "route_options": [
             ("kimi-k3-neo", "codex"),
