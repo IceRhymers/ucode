@@ -1256,7 +1256,7 @@ class TestConfigureModelsCommand:
             gemini=[],
             oss=[],
             skipped=[],
-            custom_bucketed={"cat.anthropic.claude-opus-4-8": "opus"},
+            unslotted_claude=[],
             reason=None,
             location_errors={},
         )
@@ -1265,10 +1265,6 @@ class TestConfigureModelsCommand:
             patch("ucode.cli.save_state", side_effect=lambda s: saved.update(s)),
             patch("ucode.cli.get_databricks_token", return_value="tok"),
             patch("ucode.cli.discover_model_services_across_locations", return_value=disc),
-            patch(
-                "ucode.cli.fetch_supported_api_types",
-                return_value={"cat.anthropic.claude-opus-4-8": ["anthropic/v1/messages"]},
-            ),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
         ):
             cli_module.configure_models_command(["cat.anthropic"])

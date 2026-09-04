@@ -51,7 +51,6 @@ from ucode.databricks import (
     discover_model_services_across_locations,
     ensure_databricks_auth,
     ensure_pat_bearer,
-    fetch_supported_api_types,
     find_profile_name_for_host,
     get_databricks_profiles,
     get_databricks_token,
@@ -62,7 +61,6 @@ from ucode.databricks import (
     list_tool_provider_services,
     normalize_workspace_url,
     probe_unity_gateway_capabilities,
-    required_api_type_for_family,
     resolve_pat_token,
     resolve_provider_launch_model,
     run_databricks_login,
@@ -3199,33 +3197,27 @@ def configure_tracing(
         raise typer.Exit(130) from None
 
 
-def _warn_model_location_issues(workspace: str, token: str, disc) -> None:
+def _warn_model_location_issues(disc) -> None:
     """Surface a custom-location discovery's problems: schemas that didn't list,
-    names that couldn't bucket, and bucketed services whose gateway dialect
-    doesn't match the family they routed to (a `supported_api_types` check)."""
+    services that advertise no coding-agent dialect, and Anthropic-capable
+    services whose name can't fill a Claude family slot. Everything is read from
+    the discovery result — `supported_api_types` now comes back in the listing,
+    so there is no second capability round-trip."""
     for location, reason in disc.location_errors.items():
         print_warning(f"Location `{location}` returned no models: {reason}")
     if disc.skipped:
         print_note(
-            "Skipped model service(s) whose name matches no known family "
-            f"(claude-*/gpt-*/gemini-* or an OSS family): {', '.join(disc.skipped)}. "
-            "Rename them to a recognized family to route them automatically."
+            "Skipped model service(s) that advertise no coding-agent dialect "
+            "(anthropic/v1/messages, openai/v1/responses, gemini/v1/generateContent, "
+            f"or mlflow/v1/chat/completions): {', '.join(disc.skipped)}. Point them at a "
+            "compatible destination to route them."
         )
-    if not disc.custom_bucketed:
-        return
-    with spinner("Checking model capabilities..."):
-        api_types = fetch_supported_api_types(workspace, token, sorted(disc.custom_bucketed))
-    for full_id, family in sorted(disc.custom_bucketed.items()):
-        required = required_api_type_for_family(family)
-        types = api_types.get(full_id) or []
-        # Empty types means the capability GET failed — capabilities unknown, so
-        # stay quiet rather than cry wolf on a transient blip.
-        if required and types and required not in types:
-            print_warning(
-                f"`{full_id}` is bucketed as {family} but its service exposes "
-                f"[{', '.join(types)}] — not `{required}`. Requests will fail at "
-                "inference time; point the service at a compatible destination."
-            )
+    if disc.unslotted_claude:
+        print_note(
+            "Model service(s) serve the Anthropic dialect but their name has no "
+            "`claude-<opus|sonnet|haiku|fable>-` tier, so they can't fill a Claude family "
+            f"slot: {', '.join(disc.unslotted_claude)}. Rename to a `claude-<tier>-` id."
+        )
 
 
 def _report_model_locations(workspace: str, token: str, current: list[str]) -> None:
@@ -3244,7 +3236,7 @@ def _report_model_locations(workspace: str, token: str, current: list[str]) -> N
         ("oss", ", ".join(disc.oss)),
     ):
         print_kv(label, value or "none")
-    _warn_model_location_issues(workspace, token, disc)
+    _warn_model_location_issues(disc)
 
 
 def configure_models_command(
@@ -3288,7 +3280,7 @@ def configure_models_command(
             disc = discover_model_services_across_locations(workspace, token, new_locations)
         if disc.reason:
             print_warning(f"Model discovery: {disc.reason}")
-        _warn_model_location_issues(workspace, token, disc)
+        _warn_model_location_issues(disc)
 
     # Rewrite the already-configured model agents' configs so the new models take
     # effect without re-running `ucode configure` per agent. The re-discovery

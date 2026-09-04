@@ -240,9 +240,29 @@ class TestDiscoverClaudeModels:
         assert models["fable"] == "databricks-claude-fable-5"
 
 
-def _model_service(model_id: str) -> dict:
-    """A model-services entry whose `name` strips to `model_id`."""
-    return {"name": f"model-services/{model_id}"}
+def _default_api_types(model_id: str) -> list[str]:
+    """The dialect a well-formed system.ai id implies, so name-based fixtures route
+    as they would live. `gpt-oss-*` is chat-completions (OSS), not Codex."""
+    if "claude-" in model_id:
+        return ["anthropic/v1/messages"]
+    if "gemini-" in model_id:
+        return ["gemini/v1/generateContent"]
+    if "gpt-oss" in model_id or any(f in model_id for f in ("kimi-", "glm-", "deepseek-")):
+        return ["mlflow/v1/chat/completions"]
+    if "gpt-" in model_id:
+        return ["openai/v1/responses"]
+    return []
+
+
+def _model_service(model_id: str, api_types: list[str] | None = None) -> dict:
+    """A model-services entry whose `name` strips to `model_id`.
+
+    `api_types` defaults to the dialect implied by the id's family name; pass it
+    explicitly to exercise route-primary bucketing of off-name or
+    capability-mismatched services."""
+    if api_types is None:
+        api_types = _default_api_types(model_id)
+    return {"name": f"model-services/{model_id}", "supported_api_types": api_types}
 
 
 class TestModelTokenLimits:
@@ -437,8 +457,9 @@ class TestDiscoverModelServices:
         assert calls["n"] == 3  # two failures, third succeeds
 
 
-def _services_payload(ids: list[str]) -> dict:
-    return {"model_services": [_model_service(i) for i in ids]}
+def _services_payload(ids: list[str], types: dict[str, list[str]] | None = None) -> dict:
+    types = types or {}
+    return {"model_services": [_model_service(i, types.get(i)) for i in ids]}
 
 
 class TestListSchemaModelServiceIds:
@@ -471,66 +492,35 @@ class TestListSchemaModelServiceIds:
         assert reason == "HTTP 404 not_found"
 
 
-class TestFetchSupportedApiTypes:
-    def test_maps_names_to_types(self, monkeypatch):
-        types = {
-            "cat.openai.gpt-5": ["openai/v1/responses"],
-            "cat.anthropic.claude-opus-4-8": ["anthropic/v1/messages"],
-        }
-
-        def fake_get(url, token, timeout=30):
-            full = url.split("/model-services/")[1]
-            return {"supported_api_types": types.get(full, [])}, None
-
-        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
-        result = db_mod.fetch_supported_api_types(WS, "tok", list(types))
-        assert result == types
-
-    def test_failed_get_maps_to_empty_list(self, monkeypatch):
-        monkeypatch.setattr(
-            db_mod, "_http_get_json", lambda url, token, timeout=30: (None, "HTTP 500")
+class TestListSchemaModelServices:
+    def test_returns_entries_with_api_types_from_the_listing(self, monkeypatch):
+        payload = _services_payload(
+            ["my_cat.anthropic.claude-opus-4-8"],
+            {"my_cat.anthropic.claude-opus-4-8": ["anthropic/v1/messages", "mlflow/v1/responses"]},
         )
-        result = db_mod.fetch_supported_api_types(WS, "tok", ["cat.openai.gpt-5"])
-        assert result == {"cat.openai.gpt-5": []}
-
-    def test_empty_input_is_a_noop(self, monkeypatch):
-        # Never touches the network.
         monkeypatch.setattr(
-            db_mod,
-            "_http_get_json",
-            lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not be called")),
+            db_mod, "_http_get_json", lambda url, token, timeout=30: (payload, None)
         )
-        assert db_mod.fetch_supported_api_types(WS, "tok", []) == {}
 
+        entries, reason = db_mod.list_schema_model_services(WS, "tok", "my_cat.anthropic")
 
-class TestRequiredApiTypeForFamily:
-    def test_families_map_to_dialects(self):
-        assert db_mod.required_api_type_for_family("opus") == "anthropic/v1/messages"
-        assert db_mod.required_api_type_for_family("sonnet") == "anthropic/v1/messages"
-        assert db_mod.required_api_type_for_family("codex") == "openai/v1/responses"
-        assert db_mod.required_api_type_for_family("gemini") == "gemini/v1/generateContent"
-        assert db_mod.required_api_type_for_family("oss") == "mlflow/v1/chat/completions"
-
-    def test_unknown_family_is_none(self):
-        assert db_mod.required_api_type_for_family(None) is None
-        assert db_mod.required_api_type_for_family("nonsense") is None
+        assert reason is None
+        assert [e.id for e in entries] == ["my_cat.anthropic.claude-opus-4-8"]
+        assert entries[0].api_types == frozenset({"anthropic/v1/messages", "mlflow/v1/responses"})
 
 
 class TestDiscoverModelServicesAcrossLocations:
-    def _route(self, system_ids, loc_map, api_types=None):
-        """Fake _http_get_json routing by URL: parent-scoped LISTs, plus singular
-        model-service GETs for supported_api_types."""
-        api_types = api_types or {}
+    def _route(self, system_ids, loc_map, types=None):
+        """Fake _http_get_json routing parent-scoped LISTs by URL. supported_api_types
+        rides on each LIST entry (no per-object GET); `types` overrides the
+        name-derived default for a given id."""
 
         def fake_get(url, token, timeout=30):
-            if "/model-services/" in url and "?" not in url:  # singular GET
-                full = url.split("/model-services/")[1]
-                return {"supported_api_types": api_types.get(full, [])}, None
             if "system.ai" in url:
-                return _services_payload(system_ids), None
+                return _services_payload(system_ids, types), None
             for loc, ids in loc_map.items():
                 if loc in url:  # `<catalog>.<schema>` appears in the encoded parent
-                    return _services_payload(ids), None
+                    return _services_payload(ids, types), None
             return {"model_services": []}, None
 
         return fake_get
@@ -578,7 +568,71 @@ class TestDiscoverModelServicesAcrossLocations:
         disc = db_mod.discover_model_services_across_locations(WS, "tok", ["cat.openai"])
         assert disc.codex == ["cat.openai.gpt-5-2", "system.ai.gpt-5"]
 
-    def test_skips_unbucketable_names_and_maps_custom_bucketed(self, monkeypatch):
+    def test_buckets_by_route_not_name(self, monkeypatch):
+        # A free-form name that serves the Codex dialect still lands in codex —
+        # the name-based path skipped it because it has no `gpt-` substring.
+        db_mod.clear_model_services_cache()
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            self._route(
+                [],
+                {"cat.openai": ["cat.openai.cheap-coder"]},
+                types={"cat.openai.cheap-coder": ["openai/v1/responses"]},
+            ),
+        )
+        disc = db_mod.discover_model_services_across_locations(WS, "tok", ["cat.openai"])
+        assert disc.codex == ["cat.openai.cheap-coder"]
+        assert disc.skipped == []
+
+    def test_skips_services_advertising_no_dialect(self, monkeypatch):
+        db_mod.clear_model_services_cache()
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            self._route(
+                [],
+                {"cat.misc": ["cat.misc.embedding-model", "cat.misc.claude-opus-4-8"]},
+                types={"cat.misc.embedding-model": []},
+            ),
+        )
+        disc = db_mod.discover_model_services_across_locations(WS, "tok", ["cat.misc"])
+        assert disc.skipped == ["cat.misc.embedding-model"]
+        assert disc.claude["opus"] == "cat.misc.claude-opus-4-8"
+
+    def test_anthropic_capable_without_tier_name_is_unslotted(self, monkeypatch):
+        db_mod.clear_model_services_cache()
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            self._route(
+                [],
+                {"cat.anthropic": ["cat.anthropic.house-model"]},
+                types={"cat.anthropic.house-model": ["anthropic/v1/messages"]},
+            ),
+        )
+        disc = db_mod.discover_model_services_across_locations(WS, "tok", ["cat.anthropic"])
+        assert disc.unslotted_claude == ["cat.anthropic.house-model"]
+        assert disc.claude == {}
+        assert disc.skipped == []
+
+    def test_gpt_oss_routes_to_oss_not_codex(self, monkeypatch):
+        # `gpt-oss-*` serves chat-completions, not the Codex Responses dialect —
+        # route-primary keeps it out of codex, where the `gpt-` substring put it.
+        db_mod.clear_model_services_cache()
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            self._route(["system.ai.gpt-5", "system.ai.gpt-oss-120b"], {}),
+        )
+        disc = db_mod.discover_model_services_across_locations(WS, "tok", [])
+        assert disc.codex == ["system.ai.gpt-5"]
+        assert disc.oss == ["system.ai.gpt-oss-120b"]
+
+    def test_deduplicated_claude_loser_is_not_flagged_unslotted(self, monkeypatch):
+        # Two locations both hold a claude-opus-*: cat.b wins the single opus slot,
+        # but cat.a's loser is a validly-named Claude model, not an error — it must
+        # NOT be reported as unslotted (that would emit misleading rename advice).
         db_mod.clear_model_services_cache()
         monkeypatch.setattr(
             db_mod,
@@ -586,22 +640,36 @@ class TestDiscoverModelServicesAcrossLocations:
             self._route(
                 [],
                 {
-                    "cat.anthropic": [
-                        "cat.anthropic.claude-opus-4-8",
-                        "cat.anthropic.cheap-coder",
-                    ],
-                    "cat.openai": ["cat.openai.gpt-5-2"],
+                    "cat.a": ["cat.a.claude-opus-4-6"],
+                    "cat.b": ["cat.b.claude-opus-4-7"],
                 },
             ),
         )
-        disc = db_mod.discover_model_services_across_locations(
-            WS, "tok", ["cat.anthropic", "cat.openai"]
+        disc = db_mod.discover_model_services_across_locations(WS, "tok", ["cat.a", "cat.b"])
+        assert disc.claude["opus"] == "cat.b.claude-opus-4-7"
+        assert disc.unslotted_claude == []
+
+    def test_oss_excludes_services_that_also_serve_a_native_dialect(self, monkeypatch):
+        # A Claude service may also advertise mlflow chat-completions; it must land
+        # in claude and stay out of oss (the trickiest exclusion in bucketing).
+        db_mod.clear_model_services_cache()
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            self._route(
+                ["system.ai.claude-opus-4-8"],
+                {},
+                types={
+                    "system.ai.claude-opus-4-8": [
+                        "anthropic/v1/messages",
+                        "mlflow/v1/chat/completions",
+                    ]
+                },
+            ),
         )
-        assert disc.skipped == ["cat.anthropic.cheap-coder"]
-        assert disc.custom_bucketed == {
-            "cat.anthropic.claude-opus-4-8": "opus",
-            "cat.openai.gpt-5-2": "codex",
-        }
+        disc = db_mod.discover_model_services_across_locations(WS, "tok", [])
+        assert disc.claude["opus"] == "system.ai.claude-opus-4-8"
+        assert disc.oss == []
 
     def test_location_listing_failure_is_recorded_not_fatal(self, monkeypatch):
         db_mod.clear_model_services_cache()
